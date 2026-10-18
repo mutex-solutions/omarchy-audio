@@ -60,7 +60,18 @@ Panel {
         height: Style.space(24)
 
         Text {
+          id: headerGlyph
           anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          text: "󰕾"
+          color: Color.accent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.title
+        }
+
+        Text {
+          anchors.left: headerGlyph.right
+          anchors.leftMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
           text: "Audio"
           color: Color.foreground
@@ -95,6 +106,12 @@ Panel {
             onClicked: if (root.state) root.state.toggle()
           }
         }
+      }
+
+      Rectangle {
+        width: parent.width
+        height: 1
+        color: Util.alpha(Color.foreground, 0.12)
       }
 
       Loader {
