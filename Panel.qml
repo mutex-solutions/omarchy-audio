@@ -13,6 +13,14 @@ Panel {
 
   readonly property var state: stateLoader.item
 
+  // The page runs a capture meter while it is shown. It is inside this popup
+  // and is loaded once, so it asks the popup whether it is actually open.
+  readonly property QtObject pageHost: QtObject {
+    readonly property bool open: root.opened
+    function close() { root.close() }
+    function notify(text) { console.log("audio:", String(text)) }
+  }
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -118,7 +126,11 @@ Panel {
         id: pageLoader
         width: parent.width
         source: "deck/Page.qml"
-        onLoaded: if (item) item.state = root.state
+        onLoaded: {
+          if (!item) return
+          item.host = root.pageHost
+          item.state = root.state
+        }
       }
     }
   }

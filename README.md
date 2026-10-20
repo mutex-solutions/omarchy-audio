@@ -9,8 +9,9 @@ or as a section inside [Deck](https://github.com/mutex-solutions/omarchy-deck).
 omarchy plugin add https://github.com/mutex-solutions/omarchy-audio --enable
 ```
 
-Click the speaker icon to open the panel: a volume slider and the list of output
-devices, with the current one marked.
+Click the speaker icon to open the panel: the output volume and device list,
+the microphone's volume and live level, every playing app with its own volume,
+and the sample rate or Bluetooth codec the device is using.
 
 ## Inside Deck
 
@@ -35,13 +36,20 @@ standalone widget, click opens the page directly.
 
 | File | Role |
 | --- | --- |
-| `State.qml` | volume, mute, sinks; one object shared by both modes |
+| `State.qml` | output, input, streams, and the codec/rate report; one object shared by both modes |
 | `deck/Section.qml` | the five members Deck reads, forwarded to `State` |
 | `deck/Page.qml` | the panel content, bound to `state` |
 | `Panel.qml` | the standalone bar widget and its popup |
 
-No helper binary and no polling: everything binds to Quickshell's Pipewire
+Output, input and per-app streams bind directly to Quickshell's Pipewire
 service, so a volume change from anywhere updates both modes immediately.
+
+The **Rate & codec** section reads the `audio-capability` helper's JSON report.
+That helper is the join between what the hardware advertises and what PipeWire
+is actually allowed to use, and it is the only way to show that gap honestly.
+Without it the section hides itself and says so; the rest of the panel works.
+The input meter is a real capture stream, so it runs only while the page is on
+screen, not while the widget sits in the bar.
 
 ## Requirements
 

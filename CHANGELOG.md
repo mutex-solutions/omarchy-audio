@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0
+
+- **Input.** A microphone section with its own volume, mute and default-source
+  choice, plus a live level meter under the slider. The meter is a real capture
+  stream and only runs while the page is on screen (`host.open`).
+- **Per-app streams.** Every playback stream is listed with its own volume and
+  mute, so one app can be turned down without touching the rest.
+- **Rate and codec.** A sample-rate picker driven by the device's advertised
+  rates intersected with the clock's allowed rates, Bluetooth codec switching
+  (with a `prefer` action for the next connect), LDAC quality and AAC bitrate
+  preferences, and the helper's warnings. Hidden when `audio-capability` is not
+  installed, with one line saying so.
+- The rate and codec section is a viewer that can act once on purpose; it
+  never applies a clock change on its own.
+
 ## 0.1.0
 
 First release.

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "mutex-solutions.audio",
   "name": "Audio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "mutex-solutions",
   "license": "MIT",
-  "description": "Volume, mute and output selection for Omarchy, as a bar widget or a Deck section.",
+  "description": "Output, input, per-app streams, and Bluetooth codec and rate for Omarchy, as a bar widget or a Deck section.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "Panel.qml"
