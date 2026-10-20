@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- A **4x1 tile** (`tileFull`): the device name, volume, a mute button and a
+  live volume slider. Half and compact keep the default body, so a section
+  that only wants the simple view is unchanged.
+
 ## 0.2.0
 
 - **Input.** A microphone section with its own volume, mute and default-source
