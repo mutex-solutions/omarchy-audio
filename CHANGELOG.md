@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+- **The page is rebuilt around what people do.** Output and input each get a
+  **device drop-down** (the list opens in the page, so it cannot be clipped)
+  with the volume beneath it; the speaker glyph on the output slider mutes. The
+  hero that repeated the device name is gone. The main view now fits without
+  scrolling.
+- **Apps** and **Rate & codec** are collapsible sections (Rate & codec starts
+  closed).
+- **The equalizer is its own view**, opened from an **Equalizer** row at the
+  bottom of the page, with an `Audio > Equalizer` breadcrumb and the on/off
+  switch in its header. Inside it: a profile drop-down, a folded **Find online**
+  section, the preamp, the curve, and one line per band that opens to its three
+  sliders. A ten-band profile that took about 900 px now takes about 330 px
+  collapsed. **Apply** sits in the header and appears only when there are edits.
+- Sections are separated by a spaced rule instead of a bare hairline.
+- The rate labels no longer use an em dash ("Auto, following 48 kHz").
+
 ## 0.4.1
 
 - **Sliders keep the drag.** The output, input, per-app, preamp and band sliders

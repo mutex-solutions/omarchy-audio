@@ -194,13 +194,13 @@ Item {
 
   function fmtHz(rate) {
     var r = Number(rate)
-    if (!r) return "—"
+    if (!r) return "-"
     return (r >= 1000 ? (Math.round(r / 100) / 10) : Math.round(r)) + " kHz"
   }
 
   readonly property string rateLabel: {
     if (forcedRate > 0) return "Pinned at " + fmtHz(forcedRate)
-    return inUseRate ? "Auto — following " + fmtHz(inUseRate) : "Auto — follows what is playing"
+    return inUseRate ? "Auto, following " + fmtHz(inUseRate) : "Auto, follows what is playing"
   }
 
   readonly property string codecLabel: {

@@ -9,9 +9,11 @@ or as a section inside [Deck](https://github.com/mutex-solutions/omarchy-deck).
 omarchy plugin add https://github.com/mutex-solutions/omarchy-audio --enable
 ```
 
-Click the speaker icon to open the panel: the output volume and device list,
-the microphone's volume and live level, every playing app with its own volume,
-and the sample rate or Bluetooth codec the device is using.
+Click the speaker icon to open the panel: the output and input each have a
+device drop-down with their volume under it (the microphone also shows its live
+level), then **Apps** (every playing app with its own volume) and **Rate &
+codec** (the sample rate or Bluetooth codec in use) as sections that fold away,
+and an **Equalizer** row that opens the equalizer as its own view.
 
 ## Inside Deck
 
@@ -34,18 +36,20 @@ standalone widget, click opens the page directly.
 
 ## Headphone EQ
 
-The audio page ends with an **Equalizer** section:
+The **Equalizer** row at the bottom of the audio page opens a view of its own
+(breadcrumb `Audio > Equalizer`, with the on/off switch in its header):
 
-- an on/off switch and the current profile;
+- a profile drop-down;
 - a library of built-in presets (Flat, Bass Boost, Vocal, Treble) and any
   profile you import;
-- **AutoEQ online** search by headphone model or by source (Crinacle,
+- **Find online** (folded until opened): AutoEQ search by headphone model or by source (Crinacle,
   oratory1990, Super Review, ...), or a pasted `ParametricEQ.txt` URL. The
   source line in the panel names those sources; profiles are fetched from
   `raw.githubusercontent.com/jaakkopasanen/AutoEq` and cached;
-- a response curve, a preamp and, per band, editable **type** (peak, low
-  shelf, high shelf), **frequency**, **gain** and **Q**, plus add/remove band;
-  **Apply changes** regenerates the graph;
+- a response curve, a preamp and a one-line summary per band that opens to
+  editable **type** (peak, low shelf, high shelf), **frequency**, **gain** and
+  **Q**, plus add/remove band; **Apply** (in the header, shown when there are
+  edits) regenerates the graph;
 - the live profiles are hosted as a PipeWire filter-chain sink (`deck_eq`) in a
   dedicated user service, the same shape Omarchy uses for its speaker tuning.
   Turning EQ on moves the default sink and any playing app streams through it;
