@@ -264,8 +264,26 @@ resolve_profile() {
   printf '%s\n' "$file"
 }
 
+# Values go straight into a PipeWire config, and a profile may come from a URL
+# or a hand-built --bands-json. Out-of-range or non-numeric numbers would not
+# fail here; they would fail as "the EQ sink did not appear". Clamp them to what
+# a biquad EQ can sensibly be asked for, and drop unknown filter types.
+sanitize_profile() {
+  jq -c '
+    def clamp($lo; $hi): if . < $lo then $lo elif . > $hi then $hi else . end;
+    .preamp = ((.preamp | tonumber) | clamp(-30; 10))
+    | .bands = ([.bands[:32][] | select((.type | IN("PK", "LS", "HS")))
+        | {type: .type,
+           fc:   ((.fc   | tonumber) | clamp(20; 20000)),
+           gain: ((.gain | tonumber) | clamp(-30; 30)),
+           q:    ((.q    | tonumber) | clamp(0.05; 20))}])
+  ' <<< "$1" 2>/dev/null
+}
+
 start_eq() {
-  local json="$1" profile="$2"
+  local json profile="$2"
+  # fail inside $( ) would only end the subshell and be captured as the value.
+  json="$(sanitize_profile "$1")" || fail "that profile has values the EQ cannot use"
   local hardware
   hardware="$(pactl get-default-sink 2>/dev/null || true)"
   if [[ -z $hardware || $hardware == "$SINK" ]]; then

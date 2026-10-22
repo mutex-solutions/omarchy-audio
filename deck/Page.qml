@@ -299,14 +299,73 @@ Item {
       anchors.verticalCenter: parent.verticalCenter
     }
 
+    // preventStealing: the page sits in a ScrollView, whose Flickable takes the
+    // grab as soon as a drag wanders vertically, and the slider then stops
+    // mid-gesture. The value follows the press, not the release.
     MouseArea {
       anchors.fill: parent
+      preventStealing: true
       cursorShape: Qt.PointingHandCursor
       function setFrom(x) {
         gain.moved(gain.valueAt(x / width))
       }
-      onClicked: function(mouse) { setFrom(mouse.x) }
+      onPressed: function(mouse) { setFrom(mouse.x) }
       onPositionChanged: function(mouse) { if (pressed) setFrom(mouse.x) }
+    }
+  }
+
+  // One band parameter on one line: name, slider, value. Three stacked
+  // label-then-slider pairs made a ten-band profile over a thousand pixels
+  // tall.
+  component BandSlider: Item {
+    id: bs
+    property string label: ""
+    property string valueText: ""
+    property real value: 0
+    property real minValue: 0
+    property real maxValue: 1
+    property bool logarithmic: false
+    property bool bipolar: true
+    signal moved(real v)
+
+    height: Style.space(22)
+
+    Text {
+      id: bsLabel
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(66)
+      text: bs.label
+      color: Util.alpha(Color.foreground, 0.6)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      id: bsValue
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(62)
+      horizontalAlignment: Text.AlignRight
+      text: bs.valueText
+      color: Util.alpha(Color.foreground, 0.7)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    GainSlider {
+      anchors.left: bsLabel.right
+      anchors.right: bsValue.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      value: bs.value
+      minValue: bs.minValue
+      maxValue: bs.maxValue
+      logarithmic: bs.logarithmic
+      bipolar: bs.bipolar
+      onMoved: function(v) { bs.moved(v) }
     }
   }
 
@@ -345,9 +404,11 @@ Item {
 
     MouseArea {
       anchors.fill: parent
+      preventStealing: true
       cursorShape: Qt.PointingHandCursor
-      onClicked: function(mouse) { lvl.moved(Math.round(mouse.x / width * 100)) }
-      onPositionChanged: function(mouse) { if (pressed) lvl.moved(Math.round(mouse.x / width * 100)) }
+      function setFrom(x) { lvl.moved(Math.max(0, Math.min(100, Math.round(x / width * 100)))) }
+      onPressed: function(mouse) { setFrom(mouse.x) }
+      onPositionChanged: function(mouse) { if (pressed) setFrom(mouse.x) }
     }
   }
 
@@ -504,11 +565,13 @@ Item {
 
         MouseArea {
           anchors.fill: parent
+          preventStealing: true
           cursorShape: Qt.PointingHandCursor
-          onClicked: function(mouse) { if (page.state) page.state.setVolume(Math.round(mouse.x / width * 100)) }
-          onPositionChanged: function(mouse) {
-            if (pressed && page.state) page.state.setVolume(Math.round(mouse.x / width * 100))
+          function setFrom(x) {
+            if (page.state) page.state.setVolume(Math.max(0, Math.min(100, Math.round(x / width * 100))))
           }
+          onPressed: function(mouse) { setFrom(mouse.x) }
+          onPositionChanged: function(mouse) { if (pressed) setFrom(mouse.x) }
         }
       }
     }
@@ -1137,8 +1200,9 @@ Item {
     Text {
       visible: page.state && page.state.reportLoaded && !page.state.isBluetooth
       width: parent.width
-      height: Style.space(22)
-      verticalAlignment: Text.AlignVCenter
+      wrapMode: Text.WordWrap
+      topPadding: Style.space(3)
+      bottomPadding: Style.space(3)
       leftPadding: Style.space(8)
       text: "Codec and bitrate controls appear with a Bluetooth output"
       color: Util.alpha(Color.foreground, 0.4)
@@ -1344,7 +1408,7 @@ Item {
       Text {
         anchors.fill: parent
         anchors.leftMargin: Style.space(7)
-        anchors.verticalCenter: parent.verticalCenter
+        verticalAlignment: Text.AlignVCenter
         visible: eqSearchField.text === ""
         text: "Search a headphone model or source"
         color: Util.alpha(Color.foreground, 0.35)
@@ -1472,34 +1536,10 @@ Item {
       spacing: Style.space(3)
       visible: page.state && page.state.eqLoaded && bandModel.count > 0
 
-      Item {
+      BandSlider {
         width: parent.width
-        height: Style.space(20)
-
-        Text {
-          anchors.left: parent.left
-          anchors.leftMargin: Style.space(8)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Preamp"
-          color: Util.alpha(Color.foreground, 0.7)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-          font.letterSpacing: 1.2
-        }
-
-        Text {
-          anchors.right: parent.right
-          anchors.rightMargin: Style.space(8)
-          anchors.verticalCenter: parent.verticalCenter
-          text: page.fmtGain(page.eqPreampLocal)
-          color: Util.alpha(Color.foreground, 0.7)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-        }
-      }
-
-      GainSlider {
-        width: parent.width
+        label: "Preamp"
+        valueText: page.fmtGain(page.eqPreampLocal)
         value: page.eqPreampLocal
         minValue: -15
         maxValue: 5
@@ -1518,20 +1558,51 @@ Item {
         onRevisionChanged: requestPaint()
         onPreampChanged: requestPaint()
 
+        // The real response of the biquad PipeWire runs (RBJ cookbook, the
+        // form its bq_* nodes use), at 48 kHz. Q and shelf slope therefore
+        // move the curve the way they move the sound; a hand-drawn bump did
+        // not.
         function bandResponse(f, band) {
-          var ratio = f / Math.max(1, Number(band.freq) || 1000)
-          var l = Math.log(ratio) / Math.LN2
+          var fs = 48000
+          var f0 = Math.max(1, Math.min(fs / 2 - 1, Number(band.freq) || 1000))
+          var q = Math.max(0.05, Number(band.qValue) || 0.707)
           var g = Number(band.gainDb) || 0
-          if (band.bandType === "LS") {
-            var k = Math.pow(ratio, 4)
-            return g / (1 + k)
+          var A = Math.pow(10, g / 40)
+          var w0 = 2 * Math.PI * f0 / fs
+          var cs = Math.cos(w0), sn = Math.sin(w0)
+          var alpha = sn / (2 * q)
+          var b0, b1, b2, a0, a1, a2
+          if (band.bandType === "LS" || band.bandType === "HS") {
+            var beta = 2 * Math.sqrt(A) * alpha
+            if (band.bandType === "LS") {
+              b0 = A * ((A + 1) - (A - 1) * cs + beta)
+              b1 = 2 * A * ((A - 1) - (A + 1) * cs)
+              b2 = A * ((A + 1) - (A - 1) * cs - beta)
+              a0 = (A + 1) + (A - 1) * cs + beta
+              a1 = -2 * ((A - 1) + (A + 1) * cs)
+              a2 = (A + 1) + (A - 1) * cs - beta
+            } else {
+              b0 = A * ((A + 1) + (A - 1) * cs + beta)
+              b1 = -2 * A * ((A - 1) + (A + 1) * cs)
+              b2 = A * ((A + 1) + (A - 1) * cs - beta)
+              a0 = (A + 1) - (A - 1) * cs + beta
+              a1 = 2 * ((A - 1) - (A + 1) * cs)
+              a2 = (A + 1) - (A - 1) * cs - beta
+            }
+          } else {
+            b0 = 1 + alpha * A
+            b1 = -2 * cs
+            b2 = 1 - alpha * A
+            a0 = 1 + alpha / A
+            a1 = -2 * cs
+            a2 = 1 - alpha / A
           }
-          if (band.bandType === "HS") {
-            var k2 = Math.pow(ratio, 4)
-            return g * k2 / (1 + k2)
-          }
-          var width = 0.55 / Math.max(0.3, Number(band.qValue) || 0.7) + 0.25
-          return g * Math.exp(-0.5 * Math.pow(l / width, 2))
+          var w = 2 * Math.PI * Math.min(f, fs / 2 - 1) / fs
+          var c1 = Math.cos(w), s1 = Math.sin(w), c2 = Math.cos(2 * w), s2 = Math.sin(2 * w)
+          var nr = b0 + b1 * c1 + b2 * c2, ni = -(b1 * s1 + b2 * s2)
+          var dr = a0 + a1 * c1 + a2 * c2, di = -(a1 * s1 + a2 * s2)
+          var mag2 = (nr * nr + ni * ni) / Math.max(1e-12, dr * dr + di * di)
+          return 10 * Math.log(Math.max(1e-12, mag2)) / Math.LN10
         }
 
         onPaint: {
@@ -1582,8 +1653,27 @@ Item {
             Color.foreground.b, 0.25)
           ctx.lineWidth = 1
           ctx.stroke()
+
+          // Axis labels: decades along the bottom, dB at the left.
+          ctx.fillStyle = Qt.rgba(Color.foreground.r, Color.foreground.g,
+            Color.foreground.b, 0.45)
+          ctx.font = "9px sans-serif"
+          var marks = [[20, "20"], [200, "200"], [2000, "2k"], [20000, "20k"]]
+          for (var m = 0; m < marks.length; m++) {
+            var mx = Math.log(marks[m][0] / 20) / Math.log(1000) * w
+            ctx.textAlign = m === 0 ? "left" : (m === marks.length - 1 ? "right" : "center")
+            ctx.fillText(marks[m][1], mx + (m === 0 ? 2 : (m === marks.length - 1 ? -2 : 0)), h - 2)
+          }
+          ctx.textAlign = "left"
+          var dbs = [12, -12]
+          for (var k = 0; k < dbs.length; k++)
+            ctx.fillText((dbs[k] > 0 ? "+" : "") + dbs[k], 2, mid - dbs[k] / range * mid + (dbs[k] > 0 ? 10 : -3))
         }
       }
+
+      // The axis labels sit on the canvas's last pixels; keep the first band's
+      // chip off them.
+      Item { width: parent.width; height: Style.space(4) }
 
       Repeater {
         model: bandModel
@@ -1634,33 +1724,10 @@ Item {
             }
           }
 
-          Item {
+          BandSlider {
             width: parent.width
-            height: Style.space(16)
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Frequency"
-              color: Util.alpha(Color.foreground, 0.6)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              text: page.fmtFreq(freq)
-              color: Util.alpha(Color.foreground, 0.7)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          GainSlider {
-            width: parent.width
+            label: "Frequency"
+            valueText: page.fmtFreq(freq)
             value: freq
             minValue: 20
             maxValue: 20000
@@ -1669,33 +1736,10 @@ Item {
             onMoved: function(v) { page.setBandField(index, "freq", Math.round(v)) }
           }
 
-          Item {
+          BandSlider {
             width: parent.width
-            height: Style.space(16)
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Gain"
-              color: Util.alpha(Color.foreground, 0.6)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              text: page.fmtGain(gainDb)
-              color: Util.alpha(Color.foreground, 0.7)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          GainSlider {
-            width: parent.width
+            label: "Gain"
+            valueText: page.fmtGain(gainDb)
             value: gainDb
             minValue: -15
             maxValue: 15
@@ -1704,36 +1748,16 @@ Item {
             }
           }
 
-          Item {
+          BandSlider {
             width: parent.width
-            height: Style.space(16)
-
-            Text {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              text: "Q"
-              color: Util.alpha(Color.foreground, 0.6)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              text: page.fmtQ(qValue)
-              color: Util.alpha(Color.foreground, 0.7)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-          }
-
-          GainSlider {
-            width: parent.width
+            label: "Q"
+            valueText: page.fmtQ(qValue)
             value: qValue
             minValue: 0.1
             maxValue: 10
+            // Useful Q lives between about 0.5 and 3; a linear track puts all
+            // of it in the first fifth.
+            logarithmic: true
             bipolar: false
             onMoved: function(v) {
               page.setBandField(index, "qValue", Math.round(v * 100) / 100)

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1
+
+- **Sliders keep the drag.** The output, input, per-app, preamp and band sliders
+  now set `preventStealing`. The page sits in a ScrollView, and a drag that
+  wandered vertically was taken over by scrolling, so the slider stopped
+  mid-gesture. A press also sets the value immediately instead of waiting for
+  the release.
+- **Q is logarithmic**, like frequency. Linear 0.1 to 10 put every useful value
+  in the first fifth of the track.
+- **The response curve is the real response** of the biquad PipeWire runs (RBJ
+  cookbook, 48 kHz), so Q and shelf slope move it the way they move the sound.
+  It now has decade labels and +12 and -12 dB marks.
+- **Bands take a third of the room.** Name, slider and value share one line, so
+  a ten-band profile is about 900 px instead of 1,300. The preamp uses the same
+  row.
+- The helper clamps and validates what it writes into the PipeWire config
+  (frequency 20 to 20000, gain -30 to 30, Q 0.05 to 20, preamp -30 to 10, at
+  most 32 bands, known filter types only), so a bad imported profile fails with
+  a message instead of "the EQ sink did not appear".
+- The tile glyph sits in Deck's fixed icon cell and is no longer always accent
+  coloured. The Rate and codec note wraps instead of running off the edge, and
+  the search field's placeholder is vertically centred.
+
 ## 0.4.0
 
 - **The parametric bands are fully editable**: type cycles peak / low shelf /
