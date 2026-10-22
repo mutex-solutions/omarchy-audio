@@ -1137,7 +1137,11 @@ Item {
         anchors.rightMargin: Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
         checked: page.state ? page.state.eqOn : false
-        onToggled: if (page.state) page.state.eqToggle()
+        onToggled: {
+          if (!page.state) return
+          if (!page.state.eqOn && page.eqDirty) page.applyEqChanges()
+          else page.state.eqToggle()
+        }
       }
     }
 
@@ -1539,7 +1543,11 @@ Item {
           anchors.rightMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
           label: page.state && page.state.eqOn ? "Turn off" : "Turn on"
-          onPicked: if (page.state) page.state.eqToggle()
+          onPicked: {
+            if (!page.state) return
+            if (!page.state.eqOn && page.eqDirty) page.applyEqChanges()
+            else page.state.eqToggle()
+          }
         }
       }
     }

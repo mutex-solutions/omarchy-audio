@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+- Reapplying a profile while EQ is on keeps the user's volume: the hardware
+  stays parked at 100% and the EQ sink keeps the level it had.
+- Turning EQ on from the switch or the Turn on chip applies the pending band
+  and preamp edits instead of discarding them.
+
 ## 0.3.0
 
 - **Parametric headphone EQ.** `scripts/audio-eq` hosts a PipeWire

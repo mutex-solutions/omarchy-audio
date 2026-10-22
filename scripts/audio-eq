@@ -274,9 +274,22 @@ start_eq() {
   [[ -n $hardware ]] || fail "no output sink to put the EQ in front of"
   [[ -r $HOST_SRC ]] || fail "missing $HOST_SRC (Omarchy filter-chain host)"
 
-  local hw_volume hw_mute
-  hw_volume="$(sink_volume_pct "$hardware")"; [[ -n $hw_volume ]] || hw_volume=100
-  hw_mute="$(sink_muted "$hardware")"; [[ -n $hw_mute ]] || hw_mute=0
+  local hw_volume hw_mute user_volume user_mute prev_default prev_state
+  prev_default="$(pactl get-default-sink 2>/dev/null || true)"
+  prev_state="$(load_state)"
+  if [[ $prev_default == "$SINK" ]]; then
+    # Reapplying while on: the hardware is parked at 100% and the user's level
+    # lives on the EQ sink. Keep both.
+    hw_volume="$(jq -r '.hardwareVolume // 100' <<< "$prev_state")"
+    hw_mute="$(jq -r '.hardwareMute // 0' <<< "$prev_state")"
+    user_volume="$(sink_volume_pct "$SINK")"; [[ -n $user_volume ]] || user_volume=$hw_volume
+    user_mute="$(sink_muted "$SINK")"; [[ -n $user_mute ]] || user_mute=$hw_mute
+  else
+    hw_volume="$(sink_volume_pct "$hardware")"; [[ -n $hw_volume ]] || hw_volume=100
+    hw_mute="$(sink_muted "$hardware")"; [[ -n $hw_mute ]] || hw_mute=0
+    user_volume=$hw_volume
+    user_mute=$hw_mute
+  fi
 
   systemctl --user disable --now "$SERVICE" >/dev/null 2>&1 || true
   cp "$HOST_SRC" "$HOST_CONF"
@@ -300,8 +313,8 @@ start_eq() {
   # hardware at full scale so the chain is not attenuated twice.
   pactl set-sink-volume "$hardware" 100% >/dev/null 2>&1 || true
   pactl set-sink-mute "$hardware" 0 >/dev/null 2>&1 || true
-  pactl set-sink-volume "$SINK" "${hw_volume}%" >/dev/null 2>&1 || true
-  pactl set-sink-mute "$SINK" "$hw_mute" >/dev/null 2>&1 || true
+  pactl set-sink-volume "$SINK" "${user_volume}%" >/dev/null 2>&1 || true
+  pactl set-sink-mute "$SINK" "$user_mute" >/dev/null 2>&1 || true
   pactl set-default-sink "$SINK" >/dev/null 2>&1 || true
   move_apps_to "$SINK"
 
