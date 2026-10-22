@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- A hold on the 4x1 Audio tile opens the audio page, matching the host gesture on non-custom tiles.
+
 ## 0.2.1
 
 - A **4x1 tile** (`tileFull`): the device name, volume, a mute button and a
