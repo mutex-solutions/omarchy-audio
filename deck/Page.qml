@@ -22,9 +22,13 @@ Item {
   property bool eqProfilesOpen: false
   property bool eqSearchOpen: false
   property string eqSearchText: ""
-  property var eqGains: []
+  property int bandRevision: 0
   property real eqPreampLocal: 0
   property bool eqDirty: false
+
+  // A ListModel, not a JS array: setProperty updates a slider's band without
+  // recreating the delegate, so a gain/frequency/Q drag stays continuous.
+  ListModel { id: bandModel }
 
   function fmtGain(v) {
     var n = Number(v)
@@ -35,26 +39,71 @@ Item {
     return type === "LS" ? "LOW SHELF" : type === "HS" ? "HIGH SHELF" : "PEAK"
   }
 
-  function syncEq() {
-    if (!state) return
-    var bands = state.eqBands || []
-    var gains = []
-    for (var i = 0; i < bands.length; i++) gains.push(Number(bands[i].gain))
-    eqGains = gains
-    eqPreampLocal = Number(state.eqPreamp)
-    eqDirty = false
+  function fmtFreq(v) {
+    var n = Number(v)
+    if (n >= 1000) return (Math.round(n / 100) / 10) + " kHz"
+    return Math.round(n) + " Hz"
   }
 
-  function setGain(index, value) {
-    var g = eqGains.slice()
-    g[index] = Number(value)
-    eqGains = g
+  function fmtQ(v) { return Number(v).toFixed(2) }
+
+  function syncEq() {
+    if (!state) return
+    var src = state.eqBands || []
+    bandModel.clear()
+    for (var i = 0; i < src.length; i++)
+      bandModel.append({
+        bandType: String(src[i].type || "PK"),
+        freq: Number(src[i].fc || 1000),
+        gainDb: Number(src[i].gain || 0),
+        qValue: Number(src[i].q || 0.707)
+      })
+    eqPreampLocal = Number(state.eqPreamp)
+    eqDirty = false
+    bandRevision++
+  }
+
+  function bandsArray() {
+    var out = []
+    for (var i = 0; i < bandModel.count; i++) {
+      var b = bandModel.get(i)
+      out.push({ type: b.bandType, fc: b.freq, gain: b.gainDb, q: b.qValue })
+    }
+    return out
+  }
+
+  function bandChanged() {
     eqDirty = true
+    bandRevision++
+  }
+
+  function setBandField(index, field, value) {
+    if (index < 0 || index >= bandModel.count) return
+    bandModel.setProperty(index, field, value)
+    bandChanged()
+  }
+
+  function cycleBandType(index) {
+    if (index < 0 || index >= bandModel.count) return
+    var order = ["PK", "LS", "HS"]
+    var at = order.indexOf(String(bandModel.get(index).bandType || "PK"))
+    setBandField(index, "bandType", order[(at + 1) % order.length])
+  }
+
+  function addBand() {
+    bandModel.append({ bandType: "PK", freq: 1000, gainDb: 0, qValue: 1.0 })
+    bandChanged()
+  }
+
+  function removeBand(index) {
+    if (index < 0 || index >= bandModel.count) return
+    bandModel.remove(index)
+    bandChanged()
   }
 
   function applyEqChanges() {
     if (!state || state.eqProfile === "") return
-    state.eqApply(state.eqProfile, eqPreampLocal, eqGains)
+    state.eqApplyBands(state.eqProfile, eqPreampLocal, bandsArray())
     eqDirty = false
   }
 
@@ -187,13 +236,30 @@ Item {
     property real value: 0
     property real minValue: -12
     property real maxValue: 12
+    property bool logarithmic: false
+    property bool bipolar: true
     signal moved(real v)
 
     height: Style.space(18)
 
     readonly property real span: maxValue - minValue
-    readonly property real pos: Math.max(0, Math.min(1, (value - minValue) / span))
-    readonly property real zeroPos: Math.max(0, Math.min(1, (0 - minValue) / span))
+    readonly property real clamped: Math.max(minValue, Math.min(maxValue, value))
+    readonly property real pos: {
+      if (logarithmic && minValue > 0)
+        return Math.log(clamped / minValue) / Math.log(maxValue / minValue)
+      return (clamped - minValue) / span
+    }
+    readonly property real zeroPos: {
+      if (!bipolar || minValue > 0 || maxValue < 0) return 0
+      return (0 - minValue) / span
+    }
+
+    function valueAt(p) {
+      var q = Math.max(0, Math.min(1, p))
+      if (logarithmic && minValue > 0)
+        return minValue * Math.pow(maxValue / minValue, q)
+      return minValue + q * span
+    }
 
     Rectangle {
       id: track
@@ -205,14 +271,17 @@ Item {
       color: Util.alpha(Color.foreground, 0.18)
 
       Rectangle {
-        x: Math.min(gain.pos, gain.zeroPos) * track.width
-        width: Math.abs(gain.pos - gain.zeroPos) * track.width
+        x: (gain.bipolar ? Math.min(gain.pos, gain.zeroPos) : 0) * track.width
+        width: (gain.bipolar
+          ? Math.abs(gain.pos - gain.zeroPos)
+          : gain.pos) * track.width
         height: parent.height
         radius: 2
         color: Color.accent
       }
 
       Rectangle {
+        visible: gain.bipolar && gain.minValue <= 0 && gain.maxValue >= 0
         x: gain.zeroPos * track.width - 0.5
         width: 1
         height: 7
@@ -234,8 +303,7 @@ Item {
       anchors.fill: parent
       cursorShape: Qt.PointingHandCursor
       function setFrom(x) {
-        var p = Math.max(0, Math.min(1, x / width))
-        gain.moved(gain.minValue + p * gain.span)
+        gain.moved(gain.valueAt(x / width))
       }
       onClicked: function(mouse) { setFrom(mouse.x) }
       onPositionChanged: function(mouse) { if (pressed) setFrom(mouse.x) }
@@ -1159,7 +1227,7 @@ Item {
         anchors.left: parent.left
         anchors.leftMargin: Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
-        text: "Profile"
+        text: "Local profile"
         color: Util.alpha(Color.foreground, 0.7)
         font.family: Style.font.family
         font.pixelSize: Style.font.body
@@ -1175,7 +1243,7 @@ Item {
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight
-        width: Math.max(0, parent.width - Style.space(100))
+        width: Math.max(0, parent.width - Style.space(110))
         horizontalAlignment: Text.AlignRight
       }
     }
@@ -1234,113 +1302,153 @@ Item {
           }
         }
       }
+    }
 
-      // Search AutoEQ or paste a ParametricEQ.txt URL
-      Rectangle {
-        width: parent.width
-        height: Style.space(26)
-        color: Util.alpha(Color.foreground, 0.05)
-        border.width: 1
-        border.color: Util.alpha(Color.foreground, 0.22)
-        radius: Style.cornerRadius
-
-        Text {
-          anchors.fill: parent
-          anchors.leftMargin: Style.space(7)
-          anchors.verticalCenter: parent.verticalCenter
-          visible: eqSearchField.text === ""
-          text: "Search AutoEQ, or paste a profile URL"
-          color: Util.alpha(Color.foreground, 0.35)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-        }
-
-        TextInput {
-          id: eqSearchField
-          anchors.fill: parent
-          anchors.leftMargin: Style.space(7)
-          anchors.rightMargin: Style.space(7)
-          verticalAlignment: TextInput.AlignVCenter
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-          clip: true
-          selectByMouse: true
-          onAccepted: page.eqLookup()
-        }
-      }
-
-      Item {
-        width: parent.width
-        height: Style.space(24)
-
-        Chip {
-          anchors.left: parent.left
-          anchors.leftMargin: Style.space(16)
-          anchors.verticalCenter: parent.verticalCenter
-          label: page.state && page.state.eqSearching ? "Searching…" : "Find"
-          onPicked: page.eqLookup()
-        }
-
-      }
+    // ---- online profiles ----
+    Item {
+      width: parent.width
+      height: Style.space(20)
 
       Text {
-        visible: page.state && page.state.eqSearchResults.length === 0
-          && eqSearchField.text !== ""
-        width: parent.width
-        height: Style.space(20)
-        leftPadding: Style.space(16)
-        verticalAlignment: Text.AlignVCenter
-        text: page.state && page.state.eqSearching ? "Searching AutoEQ…" : "No profiles found"
-        color: Util.alpha(Color.foreground, 0.4)
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        text: "ONLINE · AUTO EQ"
+        color: Util.alpha(Color.foreground, 0.45)
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
+        font.letterSpacing: 1.5
       }
 
-      Repeater {
-        model: page.state ? page.state.eqSearchResults : []
+    }
 
-        delegate: Item {
-          required property var modelData
-          width: col.width
-          height: Style.space(30)
+    Text {
+      width: parent.width
+      height: Style.space(16)
+      leftPadding: Style.space(8)
+      verticalAlignment: Text.AlignVCenter
+      text: "Crinacle · oratory1990 · Super Review"
+      color: Util.alpha(Color.foreground, 0.38)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
 
-          Column {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(16)
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: 1
+    Rectangle {
+      width: parent.width
+      height: Style.space(26)
+      color: Util.alpha(Color.foreground, 0.05)
+      border.width: 1
+      border.color: Util.alpha(Color.foreground, 0.22)
+      radius: Style.cornerRadius
 
-            Text {
-              width: parent.width
-              text: String(modelData.name)
-              color: Color.foreground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              elide: Text.ElideRight
-            }
+      Text {
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(7)
+        anchors.verticalCenter: parent.verticalCenter
+        visible: eqSearchField.text === ""
+        text: "Search a headphone model or source"
+        color: Util.alpha(Color.foreground, 0.35)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
 
-            Text {
-              width: parent.width
-              text: String(modelData.source) + " · " + String(modelData.category)
-              color: Util.alpha(Color.foreground, 0.45)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
-            }
+      TextInput {
+        id: eqSearchField
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(7)
+        anchors.rightMargin: Style.space(7)
+        verticalAlignment: TextInput.AlignVCenter
+        color: Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        clip: true
+        selectByMouse: true
+        onAccepted: page.eqLookup()
+      }
+    }
+
+    Item {
+      width: parent.width
+      height: Style.space(24)
+
+      Chip {
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(16)
+        anchors.verticalCenter: parent.verticalCenter
+        label: page.state && page.state.eqSearching ? "Searching…" : "Find online"
+        onPicked: page.eqLookup()
+      }
+    }
+
+    Text {
+      visible: page.state && page.state.eqSearching
+        && page.state.eqSearchResults.length === 0
+      width: parent.width
+      height: Style.space(20)
+      leftPadding: Style.space(16)
+      verticalAlignment: Text.AlignVCenter
+      text: "Searching AutoEQ…"
+      color: Util.alpha(Color.foreground, 0.4)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Text {
+      visible: page.state && !page.state.eqSearching
+        && page.state.eqSearchResults.length === 0
+        && eqSearchField.text !== ""
+      width: parent.width
+      height: Style.space(20)
+      leftPadding: Style.space(16)
+      verticalAlignment: Text.AlignVCenter
+      text: "No profiles found"
+      color: Util.alpha(Color.foreground, 0.4)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Repeater {
+      model: page.state ? page.state.eqSearchResults : []
+
+      delegate: Item {
+        required property var modelData
+        width: col.width
+        height: Style.space(32)
+
+        Column {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(16)
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: 1
+
+          Text {
+            width: parent.width
+            text: String(modelData.name)
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
           }
 
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              if (!page.state) return
-              page.state.eqApply(modelData.url, null, [])
-              page.eqProfilesOpen = false
-            }
+          Text {
+            width: parent.width
+            text: String(modelData.source) + " · " + String(modelData.category)
+            color: Util.alpha(Color.foreground, 0.45)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: {
+            if (!page.state) return
+            page.state.eqApply(modelData.url, null, [])
           }
         }
       }
@@ -1362,7 +1470,7 @@ Item {
     Column {
       width: parent.width
       spacing: Style.space(3)
-      visible: page.state && page.state.eqLoaded && page.state.eqBands.length > 0
+      visible: page.state && page.state.eqLoaded && bandModel.count > 0
 
       Item {
         width: parent.width
@@ -1405,26 +1513,25 @@ Item {
         id: eqCurve
         width: parent.width
         height: Style.space(96)
-        property var bands: page.state ? page.state.eqBands : []
-        property var gains: page.eqGains
         property real preamp: page.eqPreampLocal
-        onBandsChanged: requestPaint()
-        onGainsChanged: requestPaint()
+        property int revision: page.bandRevision
+        onRevisionChanged: requestPaint()
         onPreampChanged: requestPaint()
 
-        function bandResponse(f, band, gain) {
-          var ratio = f / Math.max(1, Number(band.fc) || 1000)
+        function bandResponse(f, band) {
+          var ratio = f / Math.max(1, Number(band.freq) || 1000)
           var l = Math.log(ratio) / Math.LN2
-          if (band.type === "LS") {
+          var g = Number(band.gainDb) || 0
+          if (band.bandType === "LS") {
             var k = Math.pow(ratio, 4)
-            return gain / (1 + k)
+            return g / (1 + k)
           }
-          if (band.type === "HS") {
+          if (band.bandType === "HS") {
             var k2 = Math.pow(ratio, 4)
-            return gain * k2 / (1 + k2)
+            return g * k2 / (1 + k2)
           }
-          var width = 0.55 / Math.max(0.3, Number(band.q) || 0.7) + 0.25
-          return gain * Math.exp(-0.5 * Math.pow(l / width, 2))
+          var width = 0.55 / Math.max(0.3, Number(band.qValue) || 0.7) + 0.25
+          return g * Math.exp(-0.5 * Math.pow(l / width, 2))
         }
 
         onPaint: {
@@ -1447,10 +1554,8 @@ Item {
           for (var x2 = 0; x2 <= w; x2 += 2) {
             var f = 20 * Math.pow(1000, x2 / w)
             var db = preamp
-            for (var i = 0; i < bands.length; i++) {
-              var g = gains.length > i ? Number(gains[i]) : Number(bands[i].gain)
-              db += bandResponse(f, bands[i], g)
-            }
+            for (var i = 0; i < bandModel.count; i++)
+              db += bandResponse(f, bandModel.get(i))
             var yy = mid - Math.max(-range, Math.min(range, db)) / range * mid
             pts.push([x2, yy])
           }
@@ -1481,24 +1586,64 @@ Item {
       }
 
       Repeater {
-        model: page.state ? page.state.eqBands : []
+        model: bandModel
 
         delegate: Column {
-          required property var modelData
-          required property int index
           width: col.width
           spacing: 1
 
           Item {
             width: parent.width
-            height: Style.space(18)
+            height: Style.space(24)
+
+            Chip {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              label: page.typeLabel(bandType) + "  ▾"
+              onPicked: page.cycleBandType(index)
+            }
+
+            Rectangle {
+              width: Style.space(18)
+              height: width
+              radius: Style.cornerRadius
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              color: removeBandMouse.containsMouse
+                ? Util.alpha(Color.urgent, 0.15) : "transparent"
+              border.width: 1
+              border.color: Util.alpha(Color.foreground, 0.3)
+
+              Text {
+                anchors.centerIn: parent
+                text: "×"
+                color: Util.alpha(Color.foreground, 0.8)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: removeBandMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: page.removeBand(index)
+              }
+            }
+          }
+
+          Item {
+            width: parent.width
+            height: Style.space(16)
 
             Text {
               anchors.left: parent.left
               anchors.leftMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              text: page.typeLabel(modelData.type) + "  ·  " + modelData.fc + " Hz"
-              color: Util.alpha(Color.foreground, 0.65)
+              text: "Frequency"
+              color: Util.alpha(Color.foreground, 0.6)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
             }
@@ -1507,8 +1652,7 @@ Item {
               anchors.right: parent.right
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              text: page.fmtGain(page.eqGains.length > index
-                ? page.eqGains[index] : modelData.gain)
+              text: page.fmtFreq(freq)
               color: Util.alpha(Color.foreground, 0.7)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -1517,11 +1661,109 @@ Item {
 
           GainSlider {
             width: parent.width
-            value: page.eqGains.length > index ? page.eqGains[index] : modelData.gain
-            minValue: -12
-            maxValue: 12
-            onMoved: function(v) { page.setGain(index, Math.round(v * 10) / 10) }
+            value: freq
+            minValue: 20
+            maxValue: 20000
+            logarithmic: true
+            bipolar: false
+            onMoved: function(v) { page.setBandField(index, "freq", Math.round(v)) }
           }
+
+          Item {
+            width: parent.width
+            height: Style.space(16)
+
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Gain"
+              color: Util.alpha(Color.foreground, 0.6)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: page.fmtGain(gainDb)
+              color: Util.alpha(Color.foreground, 0.7)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          GainSlider {
+            width: parent.width
+            value: gainDb
+            minValue: -15
+            maxValue: 15
+            onMoved: function(v) {
+              page.setBandField(index, "gainDb", Math.round(v * 10) / 10)
+            }
+          }
+
+          Item {
+            width: parent.width
+            height: Style.space(16)
+
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Q"
+              color: Util.alpha(Color.foreground, 0.6)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: page.fmtQ(qValue)
+              color: Util.alpha(Color.foreground, 0.7)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          GainSlider {
+            width: parent.width
+            value: qValue
+            minValue: 0.1
+            maxValue: 10
+            bipolar: false
+            onMoved: function(v) {
+              page.setBandField(index, "qValue", Math.round(v * 100) / 100)
+            }
+          }
+
+          Rule { }
+        }
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(26)
+
+        Chip {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          label: "+ Add band"
+          onPicked: page.addBand()
+        }
+
+        Text {
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          text: bandModel.count + " bands"
+          color: Util.alpha(Color.foreground, 0.45)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
         }
       }
 

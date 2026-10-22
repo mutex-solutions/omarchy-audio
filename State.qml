@@ -334,6 +334,15 @@ Item {
     s.eqRun(args)
   }
 
+  function eqApplyBands(profile, preamp, bands) {
+    var args = ["apply", String(profile)]
+    if (preamp !== undefined && preamp !== null)
+      args = args.concat(["--preamp", String(preamp)])
+    if (bands && bands.length)
+      args = args.concat(["--bands-json", JSON.stringify(bands)])
+    s.eqRun(args)
+  }
+
   function eqSearch(query) {
     var q = String(query || "").trim()
     if (q === "") return

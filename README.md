@@ -39,10 +39,13 @@ The audio page ends with an **Equalizer** section:
 - an on/off switch and the current profile;
 - a library of built-in presets (Flat, Bass Boost, Vocal, Treble) and any
   profile you import;
-- **AutoEQ** search by headphone model or by source (Crinacle, oratory1990,
-  Super Review, ...), or a pasted `ParametricEQ.txt` URL;
-- a response curve and one gain slider per band, plus a preamp, with **Apply
-  changes**;
+- **AutoEQ online** search by headphone model or by source (Crinacle,
+  oratory1990, Super Review, ...), or a pasted `ParametricEQ.txt` URL. The
+  source line in the panel names those sources; profiles are fetched from
+  `raw.githubusercontent.com/jaakkopasanen/AutoEq` and cached;
+- a response curve, a preamp and, per band, editable **type** (peak, low
+  shelf, high shelf), **frequency**, **gain** and **Q**, plus add/remove band;
+  **Apply changes** regenerates the graph;
 - the live profiles are hosted as a PipeWire filter-chain sink (`deck_eq`) in a
   dedicated user service, the same shape Omarchy uses for its speaker tuning.
   Turning EQ on moves the default sink and any playing app streams through it;

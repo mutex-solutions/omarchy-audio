@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+- **The parametric bands are fully editable**: type cycles peak / low shelf /
+  high shelf, and frequency (20 Hz - 20 kHz, logarithmic), gain (-15..+15 dB)
+  and Q (0.1..10) each have a slider. Bands can be added and removed. The
+  helper accepts the result as `--bands-json`, so a custom band set does not
+  have to be written back to an AutoEQ file.
+- Band edits use a `ListModel` and `setProperty`, so dragging a frequency, gain
+  or Q slider does not recreate the delegate under the pointer.
+- The online profile source is explicit: an always-visible **ONLINE · AUTO EQ**
+  section names Crinacle, oratory1990 and Super Review, with search results
+  labelled by source and category. The built-in/local profiles are in a
+  separate Local profile list.
+
 ## 0.3.1
 
 - Reapplying a profile while EQ is on keeps the user's volume: the hardware

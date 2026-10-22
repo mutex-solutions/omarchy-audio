@@ -374,11 +374,12 @@ case "${1:-status}" in
   apply)
     want="${2:-}"; [[ -n $want ]] || fail "usage: audio-eq apply <profile|url>"
     shift 2
-    pre=""; gains=""
+    pre=""; gains=""; bands_json=""
     while (($#)); do
       case "$1" in
         --preamp) pre="${2:?}"; shift 2 ;;
         --gains) gains="${2:-}"; shift 2 ;;
+        --bands-json) bands_json="${2:?}"; shift 2 ;;
         *) fail "unknown option $1" ;;
       esac
     done
@@ -392,6 +393,15 @@ case "${1:-status}" in
         | .bands = ([.bands[] | .] | to_entries
           | map(.value + {gain: (if $g[.key] == null then .value.gain else $g[.key] end)}))
       ' <<< "$json")"
+    fi
+    if [[ -n $bands_json ]]; then
+      json="$(jq -c --argjson b "$bands_json" '
+        .bands = ($b | map({
+          type: ((.type // "PK") | tostring),
+          fc: ((.fc // 1000) | tonumber),
+          gain: ((.gain // 0) | tonumber),
+          q: ((.q // 0.707) | tonumber)
+        }))' <<< "$json")" || fail "--bands-json is not a valid band array"
     fi
     start_eq "$json" "$profile"
     status_json ;;
