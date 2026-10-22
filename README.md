@@ -32,11 +32,44 @@ Then add the section to Deck's registry:
 Inside Deck the tile toggles mute on click and opens the page on hold. As a
 standalone widget, click opens the page directly.
 
+## Headphone EQ
+
+The audio page ends with an **Equalizer** section:
+
+- an on/off switch and the current profile;
+- a library of built-in presets (Flat, Bass Boost, Vocal, Treble) and any
+  profile you import;
+- **AutoEQ** search by headphone model or by source (Crinacle, oratory1990,
+  Super Review, ...), or a pasted `ParametricEQ.txt` URL;
+- a response curve and one gain slider per band, plus a preamp, with **Apply
+  changes**;
+- the live profiles are hosted as a PipeWire filter-chain sink (`deck_eq`) in a
+  dedicated user service, the same shape Omarchy uses for its speaker tuning.
+  Turning EQ on moves the default sink and any playing app streams through it;
+  turning it off restores the hardware sink and the volume levels.
+
+Profiles are AutoEQ `ParametricEQ.txt` files. The helper is
+[`scripts/audio-eq`](scripts/audio-eq); the UI calls the copy installed with
+the plugin. No root is needed. The filter-chain host config is Omarchy's own
+`/usr/share/omarchy/default/audio/filter-chain-host.conf`.
+
+With EQ on, the rate/codec report probes the **hardware** the filter feeds, so
+Bluetooth codec and bitrate controls stay available instead of disappearing
+behind the filter sink.
+
+## Codec and bitrate
+
+The **Rate & codec** section always shows the sample rate and the clock
+policy. The Bluetooth rows (codec, LDAC quality, AAC bitrate mode) appear when
+a Bluetooth output is selected; on a wired or internal output the section says
+that a Bluetooth output is needed.
+
 ## How it is built
 
 | File | Role |
 | --- | --- |
-| `State.qml` | output, input, streams, and the codec/rate report; one object shared by both modes |
+| `State.qml` | output, input, streams, codec/rate and EQ state; one object shared by both modes |
+| `scripts/audio-eq` | the PipeWire EQ host, profile parser, AutoEQ search and routing |
 | `deck/Section.qml` | the five members Deck reads, forwarded to `State` |
 | `deck/Page.qml` | the panel content, bound to `state` |
 | `Panel.qml` | the standalone bar widget and its popup |

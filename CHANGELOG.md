@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+- **Parametric headphone EQ.** `scripts/audio-eq` hosts a PipeWire
+  filter-chain in its own client (`deck_eq`), the same shape Omarchy uses for
+  its speaker tuning, and routes the default sink through it. Profiles are
+  AutoEQ `ParametricEQ.txt` files; the built-in library has Flat, Bass Boost,
+  Vocal and Treble, and AutoEQ (Crinacle, oratory1990, Super Review, ...) can
+  be searched by model or source or loaded by URL.
+- The audio page has an **Equalizer** section: on/off, profile list, AutoEQ
+  search, a response curve, a preamp and one gain slider per band. Applying a
+  gain or preamp regenerates the graph; the live EQ sink is fed from the
+  hardware output so the two are not attenuated twice.
+- With EQ on, the rate and codec report probes the **hardware** the filter
+  feeds, not the filter sink, so Bluetooth codec and bitrate controls stay.
+- The codec/bitrate note now says when those controls require a Bluetooth
+  output.
+
 ## 0.2.2
 
 - A hold on the 4x1 Audio tile opens the audio page, matching the host gesture on non-custom tiles.

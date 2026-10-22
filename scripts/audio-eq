@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+#
+# Parametric headphone EQ for PipeWire, hosted in its own filter-chain client.
+#
+#   audio-eq status
+#   audio-eq list
+#   audio-eq apply <profile|url> [--preamp dB] [--gains "g1,g2,..."]
+#   audio-eq on | off | toggle
+#   audio-eq import <url|path> [name]
+#   audio-eq search <query>
+#
+# One JSON object on stdout. Profiles are AutoEQ ParametricEQ.txt files or the
+# built-in presets in ~/.config/deck/eq/profiles.
+#
+# The graph is hosted by `pipewire -c deck-eq.conf` in a user service, the same
+# shape Omarchy uses for its speaker tuning: a dedicated client means the EQ can
+# be started and stopped without restarting pipewire-pulse (which drops every
+# PulseAudio client, including ones like Spotify that do not reconnect).
+
+set -euo pipefail
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+CONF_DIR="$CONFIG_HOME/pipewire"
+HOST_CONF="$CONF_DIR/deck-eq.conf"
+FRAG_DIR="$CONF_DIR/deck-eq.conf.d"
+FRAG="$FRAG_DIR/90-eq.conf"
+HOST_SRC="/usr/share/omarchy/default/audio/filter-chain-host.conf"
+UNIT_DIR="$CONFIG_HOME/systemd/user"
+UNIT="$UNIT_DIR/deck-eq.service"
+STATE_DIR="$STATE_HOME/deck"
+STATE="$STATE_DIR/eq.json"
+PROFILE_DIR="$CONFIG_HOME/deck/eq/profiles"
+INDEX="$CACHE_HOME/deck/autoeq-index.json"
+SINK="deck_eq"
+OUTPUT="deck_eq_output"
+SERVICE="deck-eq.service"
+
+AUTOEQ_API="https://api.github.com/repos/jaakkopasanen/AutoEq/git/trees/master?recursive=1"
+AUTOEQ_RAW="https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/"
+
+fail() {
+  jq -nc --arg error "$1" '{ok:false,error:$error}' 2>/dev/null \
+    || printf '{"ok":false,"error":"%s"}\n' "$1"
+  exit 1
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required"; }
+need jq; need pactl; need systemctl; need awk; need curl
+
+mkdir -p "$PROFILE_DIR" "$STATE_DIR" "$FRAG_DIR" "$UNIT_DIR"
+
+init_builtins() {
+  local f="$PROFILE_DIR/Flat.txt"
+  [[ -f $f ]] || cat > "$f" <<'P'
+Preamp: 0.0 dB
+Filter 1: ON PK Fc 1000 Hz Gain 0.0 dB Q 0.70
+P
+  f="$PROFILE_DIR/Bass Boost.txt"
+  [[ -f $f ]] || cat > "$f" <<'P'
+Preamp: -5.0 dB
+Filter 1: ON LS Fc 105 Hz Gain 6.0 dB Q 0.70
+Filter 2: ON PK Fc 60 Hz Gain 3.0 dB Q 1.00
+Filter 3: ON PK Fc 200 Hz Gain -1.5 dB Q 0.90
+P
+  f="$PROFILE_DIR/Vocal.txt"
+  [[ -f $f ]] || cat > "$f" <<'P'
+Preamp: -3.0 dB
+Filter 1: ON PK Fc 250 Hz Gain -2.5 dB Q 1.00
+Filter 2: ON PK Fc 3000 Hz Gain 3.0 dB Q 0.90
+Filter 3: ON HS Fc 8000 Hz Gain -1.0 dB Q 0.70
+P
+  f="$PROFILE_DIR/Treble.txt"
+  [[ -f $f ]] || cat > "$f" <<'P'
+Preamp: -4.0 dB
+Filter 1: ON HS Fc 6000 Hz Gain 4.0 dB Q 0.70
+Filter 2: ON PK Fc 10000 Hz Gain 2.0 dB Q 0.90
+P
+}
+init_builtins
+
+name_of() { basename "$1" .txt; }
+
+# AutoEQ ParametricEQ.txt -> {name, preamp, bands:[{type,fc,gain,q}]}
+parse_profile() {
+  local file="$1" name="$2"
+  [[ -r $file ]] || fail "no such profile: $file"
+  local pre
+  pre="$(awk '/^Preamp:/ {print $2; found=1; exit} END {if (!found) print 0}' "$file")"
+  [[ -n $pre ]] || pre=0
+  local rows
+  rows="$(awk '
+    /^Filter/ {
+      if ($3 != "ON") next
+      type=$4
+      label=""
+      if (type ~ /^PK/) label="PK"
+      else if (type ~ /^LS/) label="LS"
+      else if (type ~ /^HS/) label="HS"
+      else next
+      fc=$6; gain=$9; q=$12
+      if (q == "") q=0.707
+      printf "%s\t%s\t%s\t%s\n", label, fc, gain, q
+    }' "$file")"
+  jq -nc --arg name "$name" --argjson pre "$pre" --arg rows "$rows" '
+    {name:$name, preamp:$pre,
+     bands: ($rows | split("\n") | map(select(length > 0) | split("\t")
+       | {type: .[0], fc: (.[1]|tonumber), gain: (.[2]|tonumber), q: (.[3]|tonumber)}))}'
+}
+
+render_fragment() {
+  local json="$1" target="$2" out="$3"
+  local pre bands n
+  pre="$(jq -r '.preamp' <<< "$json")"
+  n="$(jq '.bands | length' <<< "$json")"
+
+  {
+    cat <<H
+context.modules = [
+  { name = libpipewire-module-filter-chain
+    args = {
+      node.description = "Headphone EQ"
+      media.name       = "Headphone EQ"
+
+      filter.graph = {
+        nodes = [
+          { type = builtin name = pre_l label = bq_highshelf control = { "Freq" = 1 "Q" = 0.707 "Gain" = $pre } }
+          { type = builtin name = pre_r label = bq_highshelf control = { "Freq" = 1 "Q" = 0.707 "Gain" = $pre } }
+H
+    local i=0
+    while IFS=$'\t' read -r type fc gain q; do
+      local label
+      case "$type" in
+        PK) label=bq_peaking ;;
+        LS) label=bq_lowshelf ;;
+        HS) label=bq_highshelf ;;
+      esac
+      printf '          { type = builtin name = b%d_l label = %s control = { "Freq" = %s "Q" = %s "Gain" = %s } }\n' "$i" "$label" "$fc" "$q" "$gain"
+      printf '          { type = builtin name = b%d_r label = %s control = { "Freq" = %s "Q" = %s "Gain" = %s } }\n' "$i" "$label" "$fc" "$q" "$gain"
+      i=$((i + 1))
+    done < <(jq -r '.bands[] | [.type, .fc, .gain, .q] | @tsv' <<< "$json")
+
+    cat <<H
+        ]
+
+        links = [
+H
+    if ((n > 0)); then
+      echo '          { output = "pre_l:Out" input = "b0_l:In" }'
+      echo '          { output = "pre_r:Out" input = "b0_r:In" }'
+      local last=$((n - 1))
+      for ((j = 0; j < last; j++)); do
+        echo "          { output = \"b${j}_l:Out\" input = \"b$((j + 1))_l:In\" }"
+        echo "          { output = \"b${j}_r:Out\" input = \"b$((j + 1))_r:In\" }"
+      done
+      echo "          # deck eq: $n bands"
+    fi
+    cat <<H
+        ]
+
+        inputs  = [ "pre_l:In" "pre_r:In" ]
+H
+    if ((n > 0)); then
+      echo "        outputs = [ \"b$((n - 1))_l:Out\" \"b$((n - 1))_r:Out\" ]"
+    else
+      echo '        outputs = [ "pre_l:Out" "pre_r:Out" ]'
+    fi
+    cat <<H
+      }
+
+      audio.channels = 2
+      audio.position = [ FL FR ]
+
+      capture.props = {
+        node.name   = "$SINK"
+        media.class = Audio/Sink
+      }
+      playback.props = {
+        node.name       = "$OUTPUT"
+        node.passive    = true
+        target.object   = "$target"
+        node.dont-move  = true
+        node.dont-fallback = true
+        node.linger     = true
+      }
+    }
+  }
+]
+H
+  } > "$out"
+}
+
+write_unit() {
+  local helper
+  helper="$(readlink -f "$0")"
+  cat > "$UNIT" <<U
+[Unit]
+Description=Deck headphone EQ filter-chain
+Documentation=https://github.com/mutex-solutions/omarchy-audio
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+Wants=wireplumber.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pipewire -c deck-eq.conf
+# A service that starts from the boot graph must route too: the default sink
+# and the application streams are not restored by the filter itself.
+ExecStartPost=$helper route
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+U
+}
+
+app_streams() {
+  pactl list sink-inputs 2>/dev/null | awk '
+    /^Sink Input #/ { id = substr($3, 2) }
+    /application\.name = / {
+      app = $0
+      sub(/.*application\.name = "/, "", app)
+      sub(/"$/, "", app)
+      if (app != "" && app != "Headphone EQ") print id
+    }'
+}
+
+move_apps_to() {
+  local target="$1" id
+  for id in $(app_streams); do
+    pactl move-sink-input "$id" "$target" 2>/dev/null || true
+  done
+}
+
+sink_exists() { pactl list sinks short 2>/dev/null | awk '{print $2}' | grep -qx "$SINK"; }
+sink_volume_pct() { pactl get-sink-volume "$1" 2>/dev/null | awk 'match($0, /[0-9]+%/) {v=substr($0, RSTART, RLENGTH-1); print v; exit}'; }
+sink_muted() { pactl get-sink-mute "$1" 2>/dev/null | awk '/Mute:/ {print ($2 == "yes" ? 1 : 0)}'; }
+
+load_state() { [[ -r $STATE ]] && cat "$STATE" || echo '{"on":false}'; }
+save_state() { printf '%s\n' "$1" > "$STATE"; }
+
+last_profile() { jq -r '.profile // "Flat"' <<< "$(load_state)"; }
+
+resolve_profile() {
+  local want="$1" name file
+  if [[ $want =~ ^https?:// ]]; then
+    name="$(basename "${want%%\?*}")"
+    name="${name//%20/ }"
+    name="${name% ParametricEQ.txt}"
+    name="${name%.txt}"
+    [[ -n $name && $name != ParametricEQ ]] || name="Imported EQ"
+    file="$PROFILE_DIR/$name.txt"
+    curl -fsSL --max-time 20 "$want" -o "$file" || fail "could not download $want"
+    grep -q '^Filter' "$file" || { rm -f "$file"; fail "that file has no AutoEQ filter lines"; }
+    printf '%s\n' "$file"
+    return
+  fi
+  if [[ -f $want ]]; then printf '%s\n' "$want"; return; fi
+  file="$PROFILE_DIR/$want.txt"
+  [[ -f $file ]] || fail "no profile named $want"
+  printf '%s\n' "$file"
+}
+
+start_eq() {
+  local json="$1" profile="$2"
+  local hardware
+  hardware="$(pactl get-default-sink 2>/dev/null || true)"
+  if [[ -z $hardware || $hardware == "$SINK" ]]; then
+    hardware="$(jq -r '.hardware // empty' <<< "$(load_state)")"
+  fi
+  [[ -n $hardware ]] || fail "no output sink to put the EQ in front of"
+  [[ -r $HOST_SRC ]] || fail "missing $HOST_SRC (Omarchy filter-chain host)"
+
+  local hw_volume hw_mute
+  hw_volume="$(sink_volume_pct "$hardware")"; [[ -n $hw_volume ]] || hw_volume=100
+  hw_mute="$(sink_muted "$hardware")"; [[ -n $hw_mute ]] || hw_mute=0
+
+  systemctl --user disable --now "$SERVICE" >/dev/null 2>&1 || true
+  cp "$HOST_SRC" "$HOST_CONF"
+  render_fragment "$json" "$hardware" "$FRAG"
+  write_unit
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl --user enable --now "$SERVICE" >/dev/null 2>&1; then
+    fail "deck-eq.service would not start: $(systemctl --user status "$SERVICE" --no-pager 2>&1 | tail -3 | tr '\n' ' ')"
+  fi
+
+  local i
+  for i in {1..24}; do sink_exists && break; sleep 0.25; done
+  sink_exists || {
+    systemctl --user disable --now "$SERVICE" >/dev/null 2>&1 || true
+    rm -f "$FRAG" "$HOST_CONF" "$UNIT"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fail "the EQ sink did not appear"
+  }
+
+  # One volume, not two: move the user's level onto the EQ sink and leave the
+  # hardware at full scale so the chain is not attenuated twice.
+  pactl set-sink-volume "$hardware" 100% >/dev/null 2>&1 || true
+  pactl set-sink-mute "$hardware" 0 >/dev/null 2>&1 || true
+  pactl set-sink-volume "$SINK" "${hw_volume}%" >/dev/null 2>&1 || true
+  pactl set-sink-mute "$SINK" "$hw_mute" >/dev/null 2>&1 || true
+  pactl set-default-sink "$SINK" >/dev/null 2>&1 || true
+  move_apps_to "$SINK"
+
+  save_state "$(jq -c --arg profile "$profile" --arg hardware "$hardware" \
+    --argjson hw_volume "$hw_volume" --argjson hw_mute "$hw_mute" \
+    '. + {on:true, profile:$profile, hardware:$hardware,
+          hardwareVolume:$hw_volume, hardwareMute:$hw_mute, updated:(now|todate)}' <<< "$json")"
+}
+
+stop_eq() {
+  local st hardware hw_volume hw_mute
+  st="$(load_state)"
+  hardware="$(jq -r '.hardware // empty' <<< "$st")"
+  hw_volume="$(jq -r '.hardwareVolume // empty' <<< "$st")"
+  hw_mute="$(jq -r '.hardwareMute // empty' <<< "$st")"
+  systemctl --user disable --now "$SERVICE" >/dev/null 2>&1 || true
+  if [[ -n $hardware ]]; then
+    pactl set-default-sink "$hardware" >/dev/null 2>&1 || true
+    move_apps_to "$hardware"
+    [[ -n $hw_volume ]] && pactl set-sink-volume "$hardware" "${hw_volume}%" >/dev/null 2>&1 || true
+    [[ -n $hw_mute ]] && pactl set-sink-mute "$hardware" "$hw_mute" >/dev/null 2>&1 || true
+  fi
+  save_state "$(jq -c '. + {on:false, updated:(now|todate)}' <<< "$st")"
+}
+
+status_json() {
+  local st
+  st="$(load_state)"
+  jq -c --arg sink "$SINK" --argjson sinkUp "$(sink_exists && echo true || echo false)" '
+    . + {sink:$sink, sinkUp:$sinkUp}' <<< "$st"
+}
+
+case "${1:-status}" in
+  route)
+    st="$(load_state)"
+    [[ "$(jq -r '.on // false' <<< "$st")" == true ]] || { status_json; exit 0; }
+    hardware="$(jq -r '.hardware // empty' <<< "$st")"
+    [[ -n $hardware ]] || fail "the EQ state has no hardware sink"
+    for i in {1..24}; do sink_exists && break; sleep 0.25; done
+    sink_exists || fail "the EQ sink did not appear"
+    hw_volume="$(jq -r '.hardwareVolume // 100' <<< "$st")"
+    hw_mute="$(jq -r '.hardwareMute // 0' <<< "$st")"
+    pactl set-sink-volume "$hardware" 100% >/dev/null 2>&1 || true
+    pactl set-sink-mute "$hardware" 0 >/dev/null 2>&1 || true
+    pactl set-sink-volume "$SINK" "${hw_volume}%" >/dev/null 2>&1 || true
+    pactl set-sink-mute "$SINK" "$hw_mute" >/dev/null 2>&1 || true
+    pactl set-default-sink "$SINK" >/dev/null 2>&1 || true
+    move_apps_to "$SINK"
+    status_json ;;
+
+  status) status_json ;;
+
+  list)
+    jq -R -s -c 'split("\n") | map(select(length>0) | {name:(sub("\\.txt$";"")), file:.})' \
+      < <(find "$PROFILE_DIR" -maxdepth 1 -type f -name '*.txt' -printf '%f\n' | sort) ;;
+
+  apply)
+    want="${2:-}"; [[ -n $want ]] || fail "usage: audio-eq apply <profile|url>"
+    shift 2
+    pre=""; gains=""
+    while (($#)); do
+      case "$1" in
+        --preamp) pre="${2:?}"; shift 2 ;;
+        --gains) gains="${2:-}"; shift 2 ;;
+        *) fail "unknown option $1" ;;
+      esac
+    done
+    file="$(resolve_profile "$want")"
+    profile="$(name_of "$file")"
+    json="$(parse_profile "$file" "$profile")"
+    if [[ -n $pre ]]; then json="$(jq -c --argjson p "$pre" '.preamp=$p' <<< "$json")"; fi
+    if [[ -n $gains ]]; then
+      json="$(jq -c --arg g "$gains" '
+        ($g | split(",") | map(tonumber? // null)) as $g
+        | .bands = ([.bands[] | .] | to_entries
+          | map(.value + {gain: (if $g[.key] == null then .value.gain else $g[.key] end)}))
+      ' <<< "$json")"
+    fi
+    start_eq "$json" "$profile"
+    status_json ;;
+
+  on)
+    file="$(resolve_profile "$(last_profile)")"
+    json="$(parse_profile "$file" "$(name_of "$file")")"
+    start_eq "$json" "$(name_of "$file")"
+    status_json ;;
+
+  off) stop_eq; status_json ;;
+
+  toggle)
+    if [[ "$(jq -r '.on // false' <<< "$(load_state)")" == true ]]; then
+      stop_eq
+    else
+      file="$(resolve_profile "$(last_profile)")"
+      json="$(parse_profile "$file" "$(name_of "$file")")"
+      start_eq "$json" "$(name_of "$file")"
+    fi
+    status_json ;;
+
+  import)
+    want="${2:-}"; [[ -n $want ]] || fail "usage: audio-eq import <url|path> [name]"
+    name="${3:-}"
+    if [[ $want =~ ^https?:// ]]; then
+      tmp="$(mktemp)"
+      curl -fsSL --max-time 20 "$want" -o "$tmp" || fail "could not download $want"
+      [[ -n $name ]] || name="$(basename "${want%%\?*}" .txt)"
+      [[ -n $name ]] || name="Imported EQ"
+      grep -q '^Filter' "$tmp" || { rm -f "$tmp"; fail "that file has no AutoEQ filter lines"; }
+      mv "$tmp" "$PROFILE_DIR/$name.txt"
+    else
+      [[ -r $want ]] || fail "no such file: $want"
+      [[ -n $name ]] || name="$(name_of "$want")"
+      cp "$want" "$PROFILE_DIR/$name.txt"
+    fi
+    jq -nc --arg name "$name" --arg file "$PROFILE_DIR/$name.txt" \
+      '{ok:true, imported:$name, file:$file}' ;;
+
+  search)
+    q="${2:-}"; [[ -n $q ]] || fail "usage: audio-eq search <query>"
+    if [[ ! -s $INDEX ]] || [[ $(find "$INDEX" -mtime +7 2>/dev/null) ]]; then
+      mkdir -p "$(dirname "$INDEX")"
+      tmp_md="$(mktemp)"; tmp_tsv="$(mktemp)"
+      trap 'rm -f "$tmp_md" "$tmp_tsv"' RETURN
+      curl -fsSL --max-time 60 \
+        "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/INDEX.md" \
+        -o "$tmp_md" || fail "could not fetch the AutoEQ index"
+
+      while IFS= read -r line; do
+        case "$line" in '- ['*) ;; *) continue ;; esac
+        line="${line% by *}"
+        name="${line#*[}"; name="${name%%]*}"
+        rest="${line#*](./}"; path="${rest%)}"
+        [[ -n $name && -n $path ]] || continue
+        printf '%s\t%s\n' "$name" "$path"
+      done < "$tmp_md" > "$tmp_tsv"
+
+      jq -R -s -c --arg base "$AUTOEQ_RAW" '
+        split("\n") | map(select(length > 0) | split("\t")
+          | . as $r
+          | ($r[1] | split("/")) as $p
+          | {name: $r[0],
+             source: ($p[0] | gsub("%20"; " ")),
+             category: ($p[1] | gsub("%20"; " ")),
+             url: ($base + "results/" + $r[1] + "/" + $p[-1] + "%20ParametricEQ.txt")})
+        | unique_by(.url)' "$tmp_tsv" > "$INDEX" \
+        || fail "could not build the AutoEQ index"
+    fi
+    jq -c --arg q "$(tr '[:upper:]' '[:lower:]' <<< "$q")" '
+      [ .[] | select(
+          ((.name|ascii_downcase) | contains($q))
+          or ((.source|ascii_downcase) | contains($q))
+          or ((.category|ascii_downcase) | contains($q))) ][:30]' "$INDEX" ;;
+
+  *) fail "usage: audio-eq status|list|apply|on|off|toggle|import|search" ;;
+esac

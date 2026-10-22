@@ -219,6 +219,144 @@ Item {
     return (b !== null && b !== undefined) ? ("AAC mode " + b) : ""
   }
 
+  // ------------------------------------------------------- headphone EQ
+  readonly property string eqHelper: String(Qt.resolvedUrl("scripts/audio-eq")).replace("file://", "")
+  property var eq: ({})
+  property bool eqLoaded: false
+  property var eqProfiles: []
+  property var eqSearchResults: []
+  property bool eqSearching: false
+  property string eqError: ""
+
+  readonly property bool eqOn: eq.on === true
+  readonly property string eqProfile: String(eq.profile || "")
+  readonly property real eqPreamp: Number(eq.preamp || 0)
+  readonly property var eqBands: eq.bands || []
+  readonly property string eqHardware: String(eq.hardware || "")
+  readonly property bool eqSinkUp: eq.sinkUp === true
+
+  Process {
+    id: eqStatusProc
+    command: [s.eqHelper, "status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw === "") return
+        try {
+          s.eq = JSON.parse(raw)
+          s.eqLoaded = true
+          s.refreshReport()
+        } catch (e) {
+        }
+      }
+    }
+  }
+
+  Process {
+    id: eqListProc
+    command: [s.eqHelper, "list"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw === "") return
+        try { s.eqProfiles = JSON.parse(raw) } catch (e) {}
+      }
+    }
+  }
+
+  Process {
+    id: eqSearchProc
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        s.eqSearching = false
+        if (raw === "") return
+        try { s.eqSearchResults = JSON.parse(raw) } catch (e) { s.eqSearchResults = [] }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var e = String(text || "").trim()
+        if (e !== "") s.eqError = e.split("\n")[0]
+        s.eqSearching = false
+      }
+    }
+  }
+
+  Process {
+    id: eqActionProc
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw === "") return
+        try {
+          var res = JSON.parse(raw)
+          if (res && res.ok === false) s.eqError = String(res.error || "EQ action failed")
+        } catch (e) {}
+      }
+    }
+    onExited: function(code) {
+      if (code === 0) s.eqError = ""
+      s.refreshEq()
+      s.eqListProfiles()
+    }
+  }
+
+  function refreshEq() {
+    if (!eqStatusProc.running) eqStatusProc.running = true
+  }
+
+  function eqListProfiles() {
+    if (!eqListProc.running) eqListProc.running = true
+  }
+
+  function eqRun(args) {
+    eqActionProc.command = [s.eqHelper].concat(args)
+    eqActionProc.running = true
+  }
+
+  function eqToggle() {
+    s.eqRun([s.eqOn ? "off" : "on"])
+  }
+
+  function eqApply(profile, preamp, gains) {
+    var args = ["apply", String(profile)]
+    if (preamp !== undefined && preamp !== null) args = args.concat(["--preamp", String(preamp)])
+    if (gains && gains.length)
+      args = args.concat(["--gains", gains.join(",")])
+    s.eqRun(args)
+  }
+
+  function eqSearch(query) {
+    var q = String(query || "").trim()
+    if (q === "") return
+    s.eqSearching = true
+    s.eqSearchResults = []
+    s.eqError = ""
+    eqSearchProc.command = [s.eqHelper, "search", q]
+    eqSearchProc.running = true
+  }
+
+  function eqImport(url, name) {
+    var args = ["import", String(url)]
+    if (name) args.push(String(name))
+    s.eqRun(args)
+  }
+
+  Timer {
+    interval: 5000
+    running: true
+    repeat: true
+    onTriggered: s.refreshEq()
+  }
+
   Process {
     id: capProc
     command: ["audio-capability"]
@@ -237,6 +375,11 @@ Item {
   }
 
   function refreshReport() {
+    // With EQ on, the default sink is the filter sink, which has no hardware
+    // capability. Probe the hardware the filter feeds instead.
+    var args = ["audio-capability"]
+    if (s.eqOn && s.eqHardware !== "") args = args.concat(["--device", s.eqHardware])
+    capProc.command = args
     if (!capProc.running) capProc.running = true
   }
 
@@ -278,5 +421,9 @@ Item {
     onTriggered: s.refreshReport()
   }
 
-  Component.onCompleted: refreshReport()
+  Component.onCompleted: {
+    refreshReport()
+    refreshEq()
+    eqListProfiles()
+  }
 }

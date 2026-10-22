@@ -18,11 +18,71 @@ Item {
   property bool rateOpen: false
   property bool codecOpen: false
 
+  // ------------------------------------------------------------- equalizer
+  property bool eqProfilesOpen: false
+  property bool eqSearchOpen: false
+  property string eqSearchText: ""
+  property var eqGains: []
+  property real eqPreampLocal: 0
+  property bool eqDirty: false
+
+  function fmtGain(v) {
+    var n = Number(v)
+    return (n > 0 ? "+" : "") + n.toFixed(1) + " dB"
+  }
+
+  function typeLabel(type) {
+    return type === "LS" ? "LOW SHELF" : type === "HS" ? "HIGH SHELF" : "PEAK"
+  }
+
+  function syncEq() {
+    if (!state) return
+    var bands = state.eqBands || []
+    var gains = []
+    for (var i = 0; i < bands.length; i++) gains.push(Number(bands[i].gain))
+    eqGains = gains
+    eqPreampLocal = Number(state.eqPreamp)
+    eqDirty = false
+  }
+
+  function setGain(index, value) {
+    var g = eqGains.slice()
+    g[index] = Number(value)
+    eqGains = g
+    eqDirty = true
+  }
+
+  function applyEqChanges() {
+    if (!state || state.eqProfile === "") return
+    state.eqApply(state.eqProfile, eqPreampLocal, eqGains)
+    eqDirty = false
+  }
+
+  function eqLookup() {
+    if (!state) return
+    var q = String(eqSearchField.text || "").trim()
+    if (q === "") return
+    if (q.indexOf("http://") === 0 || q.indexOf("https://") === 0)
+      state.eqApply(q, null, [])
+    else
+      state.eqSearch(q)
+  }
+
   // The input meter is a capture stream. Run it only while this page is on
   // screen: `host.open` is Deck's (or the standalone popup's) visibility, and a
   // page with no host is a page that is only built when it is about to be shown.
   readonly property bool pageVisible: host && host.open !== undefined ? !!host.open : true
-  onStateChanged: if (state) state.meterActive = pageVisible
+  onStateChanged: {
+    if (state) {
+      state.meterActive = pageVisible
+      syncEq()
+    }
+  }
+
+  Connections {
+    target: page.state
+    function onEqProfileChanged() { page.syncEq() }
+  }
   onPageVisibleChanged: if (state) state.meterActive = pageVisible
   Component.onDestruction: if (state) state.meterActive = false
 
@@ -88,6 +148,99 @@ Item {
     }
   }
 
+
+  component Switch: Item {
+    id: sw
+    property bool checked: false
+    signal toggled()
+    width: Style.space(34)
+    height: Style.space(18)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: height / 2
+      color: sw.checked
+        ? Util.alpha(Color.accent, 0.85)
+        : Util.alpha(Color.foreground, 0.2)
+
+      Rectangle {
+        width: Style.space(14)
+        height: width
+        radius: width / 2
+        y: (parent.height - height) / 2
+        x: sw.checked ? parent.width - width - Style.space(2) : Style.space(2)
+        color: "#ffffff"
+        Behavior on x { NumberAnimation { duration: 90 } }
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      onClicked: sw.toggled()
+    }
+  }
+
+  // A horizontal gain slider with a zero mark, for a -12..+12 dB band.
+  component GainSlider: Item {
+    id: gain
+    property real value: 0
+    property real minValue: -12
+    property real maxValue: 12
+    signal moved(real v)
+
+    height: Style.space(18)
+
+    readonly property real span: maxValue - minValue
+    readonly property real pos: Math.max(0, Math.min(1, (value - minValue) / span))
+    readonly property real zeroPos: Math.max(0, Math.min(1, (0 - minValue) / span))
+
+    Rectangle {
+      id: track
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      height: 3
+      radius: 2
+      color: Util.alpha(Color.foreground, 0.18)
+
+      Rectangle {
+        x: Math.min(gain.pos, gain.zeroPos) * track.width
+        width: Math.abs(gain.pos - gain.zeroPos) * track.width
+        height: parent.height
+        radius: 2
+        color: Color.accent
+      }
+
+      Rectangle {
+        x: gain.zeroPos * track.width - 0.5
+        width: 1
+        height: 7
+        y: -2
+        color: Util.alpha(Color.foreground, 0.4)
+      }
+    }
+
+    Rectangle {
+      width: 9
+      height: 9
+      radius: 5
+      color: Color.accent
+      x: Math.max(0, Math.min(parent.width, gain.pos * parent.width)) - width / 2
+      anchors.verticalCenter: parent.verticalCenter
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: Qt.PointingHandCursor
+      function setFrom(x) {
+        var p = Math.max(0, Math.min(1, x / width))
+        gain.moved(gain.minValue + p * gain.span)
+      }
+      onClicked: function(mouse) { setFrom(mouse.x) }
+      onPositionChanged: function(mouse) { if (pressed) setFrom(mouse.x) }
+    }
+  }
 
   component Level: Item {
     id: lvl
@@ -913,6 +1066,18 @@ Item {
       }
     }
 
+    Text {
+      visible: page.state && page.state.reportLoaded && !page.state.isBluetooth
+      width: parent.width
+      height: Style.space(22)
+      verticalAlignment: Text.AlignVCenter
+      leftPadding: Style.space(8)
+      text: "Codec and bitrate controls appear with a Bluetooth output"
+      color: Util.alpha(Color.foreground, 0.4)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
     Repeater {
       model: page.state ? page.state.warnings : []
 
@@ -927,6 +1092,455 @@ Item {
         color: Util.alpha(Color.foreground, 0.5)
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
+      }
+    }
+
+    Rule { }
+
+    // ---- headphone EQ ----
+    Head {
+      glyph: "󰒓"
+      title: "Equalizer"
+      value: page.state && page.state.eqOn
+        ? (page.state.eqProfile || "on") : "off"
+      gap: Style.space(4)
+    }
+
+    Text {
+      visible: page.state && !page.state.eqLoaded
+      width: parent.width
+      height: Style.space(24)
+      verticalAlignment: Text.AlignVCenter
+      leftPadding: Style.space(8)
+      text: "Install audio-eq to enable headphone EQ"
+      color: Util.alpha(Color.foreground, 0.4)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Item {
+      width: parent.width
+      height: Style.space(30)
+
+      Text {
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Headphone EQ"
+        color: Color.foreground
+        font.family: Style.font.family
+        font.pixelSize: Style.font.body
+      }
+
+      Switch {
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        checked: page.state ? page.state.eqOn : false
+        onToggled: if (page.state) page.state.eqToggle()
+      }
+    }
+
+    Item {
+      width: parent.width
+      height: Style.space(30)
+
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: page.eqProfilesOpen = !page.eqProfilesOpen
+      }
+
+      Text {
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        text: "Profile"
+        color: Util.alpha(Color.foreground, 0.7)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.body
+      }
+
+      Text {
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        text: (page.state && page.state.eqProfile !== ""
+          ? page.state.eqProfile : "Choose a profile") + "  ▾"
+        color: Color.accent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        width: Math.max(0, parent.width - Style.space(100))
+        horizontalAlignment: Text.AlignRight
+      }
+    }
+
+    Column {
+      width: parent.width
+      spacing: Style.space(1)
+      visible: page.eqProfilesOpen
+
+      Repeater {
+        model: page.state ? page.state.eqProfiles : []
+
+        delegate: Item {
+          required property var modelData
+          readonly property bool current: page.state
+            && page.state.eqProfile === String(modelData.name)
+          width: col.width
+          height: Style.space(28)
+
+          Rectangle {
+            anchors.fill: parent
+            color: current ? Util.alpha(Color.accent, Style.selectedFillAlpha) : "transparent"
+          }
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(16)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(24)
+            anchors.verticalCenter: parent.verticalCenter
+            text: String(modelData.name)
+            color: current ? Color.accent : Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+
+          Text {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(9)
+            anchors.verticalCenter: parent.verticalCenter
+            text: current ? "✓" : ""
+            color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+              if (!page.state) return
+              page.state.eqApply(modelData.name, null, [])
+              page.eqProfilesOpen = false
+            }
+          }
+        }
+      }
+
+      // Search AutoEQ or paste a ParametricEQ.txt URL
+      Rectangle {
+        width: parent.width
+        height: Style.space(26)
+        color: Util.alpha(Color.foreground, 0.05)
+        border.width: 1
+        border.color: Util.alpha(Color.foreground, 0.22)
+        radius: Style.cornerRadius
+
+        Text {
+          anchors.fill: parent
+          anchors.leftMargin: Style.space(7)
+          anchors.verticalCenter: parent.verticalCenter
+          visible: eqSearchField.text === ""
+          text: "Search AutoEQ, or paste a profile URL"
+          color: Util.alpha(Color.foreground, 0.35)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        TextInput {
+          id: eqSearchField
+          anchors.fill: parent
+          anchors.leftMargin: Style.space(7)
+          anchors.rightMargin: Style.space(7)
+          verticalAlignment: TextInput.AlignVCenter
+          color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          clip: true
+          selectByMouse: true
+          onAccepted: page.eqLookup()
+        }
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(24)
+
+        Chip {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(16)
+          anchors.verticalCenter: parent.verticalCenter
+          label: page.state && page.state.eqSearching ? "Searching…" : "Find"
+          onPicked: page.eqLookup()
+        }
+
+      }
+
+      Text {
+        visible: page.state && page.state.eqSearchResults.length === 0
+          && eqSearchField.text !== ""
+        width: parent.width
+        height: Style.space(20)
+        leftPadding: Style.space(16)
+        verticalAlignment: Text.AlignVCenter
+        text: page.state && page.state.eqSearching ? "Searching AutoEQ…" : "No profiles found"
+        color: Util.alpha(Color.foreground, 0.4)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Repeater {
+        model: page.state ? page.state.eqSearchResults : []
+
+        delegate: Item {
+          required property var modelData
+          width: col.width
+          height: Style.space(30)
+
+          Column {
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(16)
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 1
+
+            Text {
+              width: parent.width
+              text: String(modelData.name)
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              text: String(modelData.source) + " · " + String(modelData.category)
+              color: Util.alpha(Color.foreground, 0.45)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+              if (!page.state) return
+              page.state.eqApply(modelData.url, null, [])
+              page.eqProfilesOpen = false
+            }
+          }
+        }
+      }
+    }
+
+    Text {
+      visible: page.state && page.state.eqError !== ""
+      width: parent.width
+      wrapMode: Text.Wrap
+      leftPadding: Style.space(8)
+      rightPadding: Style.space(8)
+      topPadding: Style.space(2)
+      text: page.state ? page.state.eqError : ""
+      color: Color.urgent
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    Column {
+      width: parent.width
+      spacing: Style.space(3)
+      visible: page.state && page.state.eqLoaded && page.state.eqBands.length > 0
+
+      Item {
+        width: parent.width
+        height: Style.space(20)
+
+        Text {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Preamp"
+          color: Util.alpha(Color.foreground, 0.7)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          font.letterSpacing: 1.2
+        }
+
+        Text {
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          text: page.fmtGain(page.eqPreampLocal)
+          color: Util.alpha(Color.foreground, 0.7)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      GainSlider {
+        width: parent.width
+        value: page.eqPreampLocal
+        minValue: -15
+        maxValue: 5
+        onMoved: function(v) {
+          page.eqPreampLocal = Math.round(v * 10) / 10
+          page.eqDirty = true
+        }
+      }
+
+      Canvas {
+        id: eqCurve
+        width: parent.width
+        height: Style.space(96)
+        property var bands: page.state ? page.state.eqBands : []
+        property var gains: page.eqGains
+        property real preamp: page.eqPreampLocal
+        onBandsChanged: requestPaint()
+        onGainsChanged: requestPaint()
+        onPreampChanged: requestPaint()
+
+        function bandResponse(f, band, gain) {
+          var ratio = f / Math.max(1, Number(band.fc) || 1000)
+          var l = Math.log(ratio) / Math.LN2
+          if (band.type === "LS") {
+            var k = Math.pow(ratio, 4)
+            return gain / (1 + k)
+          }
+          if (band.type === "HS") {
+            var k2 = Math.pow(ratio, 4)
+            return gain * k2 / (1 + k2)
+          }
+          var width = 0.55 / Math.max(0.3, Number(band.q) || 0.7) + 0.25
+          return gain * Math.exp(-0.5 * Math.pow(l / width, 2))
+        }
+
+        onPaint: {
+          var ctx = getContext("2d")
+          var w = width, h = height, mid = h / 2, range = 18
+          ctx.clearRect(0, 0, w, h)
+          ctx.lineWidth = 1
+          ctx.strokeStyle = Qt.rgba(Color.foreground.r, Color.foreground.g,
+            Color.foreground.b, 0.12)
+          for (var d = -12; d <= 12; d += 6) {
+            var y = mid - d / range * mid
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke()
+          }
+          for (var fq = 20; fq <= 20000; fq *= 10) {
+            var x = Math.log(fq / 20) / Math.log(1000) * w
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke()
+          }
+
+          var pts = []
+          for (var x2 = 0; x2 <= w; x2 += 2) {
+            var f = 20 * Math.pow(1000, x2 / w)
+            var db = preamp
+            for (var i = 0; i < bands.length; i++) {
+              var g = gains.length > i ? Number(gains[i]) : Number(bands[i].gain)
+              db += bandResponse(f, bands[i], g)
+            }
+            var yy = mid - Math.max(-range, Math.min(range, db)) / range * mid
+            pts.push([x2, yy])
+          }
+
+          ctx.beginPath()
+          ctx.moveTo(0, mid)
+          for (var p = 0; p < pts.length; p++) ctx.lineTo(pts[p][0], pts[p][1])
+          ctx.lineTo(w, mid)
+          ctx.closePath()
+          ctx.fillStyle = Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)
+          ctx.fill()
+
+          ctx.beginPath()
+          for (var q = 0; q < pts.length; q++) {
+            if (q === 0) ctx.moveTo(pts[q][0], pts[q][1])
+            else ctx.lineTo(pts[q][0], pts[q][1])
+          }
+          ctx.strokeStyle = Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.9)
+          ctx.lineWidth = 1.5
+          ctx.stroke()
+
+          ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid)
+          ctx.strokeStyle = Qt.rgba(Color.foreground.r, Color.foreground.g,
+            Color.foreground.b, 0.25)
+          ctx.lineWidth = 1
+          ctx.stroke()
+        }
+      }
+
+      Repeater {
+        model: page.state ? page.state.eqBands : []
+
+        delegate: Column {
+          required property var modelData
+          required property int index
+          width: col.width
+          spacing: 1
+
+          Item {
+            width: parent.width
+            height: Style.space(18)
+
+            Text {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: page.typeLabel(modelData.type) + "  ·  " + modelData.fc + " Hz"
+              color: Util.alpha(Color.foreground, 0.65)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: page.fmtGain(page.eqGains.length > index
+                ? page.eqGains[index] : modelData.gain)
+              color: Util.alpha(Color.foreground, 0.7)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          GainSlider {
+            width: parent.width
+            value: page.eqGains.length > index ? page.eqGains[index] : modelData.gain
+            minValue: -12
+            maxValue: 12
+            onMoved: function(v) { page.setGain(index, Math.round(v * 10) / 10) }
+          }
+        }
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(26)
+
+        Chip {
+          visible: page.eqDirty
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          label: "Apply changes"
+          onPicked: page.applyEqChanges()
+        }
+
+        Chip {
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          label: page.state && page.state.eqOn ? "Turn off" : "Turn on"
+          onPicked: if (page.state) page.state.eqToggle()
+        }
       }
     }
   }
