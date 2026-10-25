@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.0
+
+- **Find online searches as you type.** The query runs one second after you
+  stop typing, a newer query replaces one still in flight, and a pasted address
+  waits for Enter. Results are grouped by provider with a count, three rows
+  each and a "Show N more" row.
+- **Sources page** (`Audio > Equalizer > Sources`): switch sources on and off,
+  add a GitHub repo in AutoEq layout, a JSON list address or a local folder,
+  remove the ones you added, refresh. A source that cannot be read is refused
+  at add time and reported in the results rather than failing the search.
+  `audio-eq` gained `sources`, `source-add`, `source-remove`, `source-enable`
+  and `source-refresh`.
+- A profile picked from a search is saved as `Name (Provider)`, so the same
+  headphone from two providers no longer overwrites itself.
+- **Rate & codec uses drop-downs.** Sample rate lists what the device offers,
+  and a rate PipeWire has not been told about is marked "not registered";
+  choosing it registers it and then pins it. A **Registered rates** block shows
+  what the clock may switch between and has **Discover**, **Register**,
+  **Make live** (restarts WirePlumber) and **Remove** (asks twice). Bluetooth
+  gets drop-downs for codec now, preferred codec at connect, LDAC quality and
+  AAC bitrate mode.
+- Fixed the INDEX parser cutting names that contain a bracket, such as
+  "(footsteps preset)".
+
 ## 0.5.0
 
 - **The page is rebuilt around what people do.** Output and input each get a

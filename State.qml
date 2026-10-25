@@ -176,21 +176,8 @@ Item {
     return (pol && pol.forcedRate) ? Number(pol.forcedRate) : 0
   }
 
-  // Only the intersection of what the device advertises and what the clock is
-  // allowed to reach. A rate outside it would be a control that is accepted
-  // and does nothing.
-  readonly property var rateOptions: {
-    var cap = (report.capability && report.capability.rates) || []
-    var allowed = (report.policy && report.policy.allowedRates) || []
-    var out = []
-    for (var i = 0; i < cap.length; i++)
-      if (allowed.indexOf(cap[i]) !== -1) out.push(cap[i])
-    return out
-  }
-
   readonly property var hardwareRates: (report.capability && report.capability.rates) || []
   readonly property int inUseRate: (report.inUse && report.inUse.rate) ? Number(report.inUse.rate) : 0
-  readonly property bool canApplyRates: hardwareRates.length > 0 && rateOptions.length === 0
 
   function fmtHz(rate) {
     var r = Number(rate)
@@ -226,6 +213,11 @@ Item {
   property var eqProfiles: []
   property var eqSearchResults: []
   property bool eqSearching: false
+  // Providers whose index could not be read for the last search, by source id.
+  property var eqSearchFailed: []
+  property var eqSources: []
+  property string eqSourcesError: ""
+  property bool eqSourcesBusy: false
   property string eqError: ""
 
   readonly property bool eqOn: eq.on === true
@@ -266,6 +258,11 @@ Item {
     }
   }
 
+  // A new query while one is in flight replaces it: the old process is killed
+  // and the newest text is started once it has exited, so a slow response for
+  // "hd" can never overwrite the results for "hd 650".
+  property string eqPendingQuery: ""
+
   Process {
     id: eqSearchProc
     command: []
@@ -273,17 +270,46 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var raw = String(text || "").trim()
+        if (s.eqPendingQuery !== "") return
         s.eqSearching = false
         if (raw === "") return
-        try { s.eqSearchResults = JSON.parse(raw) } catch (e) { s.eqSearchResults = [] }
+        try {
+          var res = JSON.parse(raw)
+          if (res && res.ok === false) {
+            s.eqSearchResults = []
+            s.eqError = String(res.error || "search failed")
+          } else {
+            s.eqSearchResults = res.results || []
+            s.eqSearchFailed = res.failed || []
+          }
+        } catch (e) { s.eqSearchResults = [] }
       }
     }
-    stderr: StdioCollector {
+    onExited: function(code) {
+      if (s.eqPendingQuery === "") return
+      var q = s.eqPendingQuery
+      s.eqPendingQuery = ""
+      s.eqStartSearch(q)
+    }
+  }
+
+  Process {
+    id: eqSourcesProc
+    command: []
+    stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var e = String(text || "").trim()
-        if (e !== "") s.eqError = e.split("\n")[0]
-        s.eqSearching = false
+        var raw = String(text || "").trim()
+        s.eqSourcesBusy = false
+        if (raw === "") return
+        try {
+          var res = JSON.parse(raw)
+          if (res && res.ok === false) s.eqSourcesError = String(res.error || "that did not work")
+          else {
+            s.eqSources = res.sources || []
+            s.eqSourcesError = ""
+          }
+        } catch (e) {}
       }
     }
   }
@@ -343,14 +369,57 @@ Item {
     s.eqRun(args)
   }
 
-  function eqSearch(query) {
-    var q = String(query || "").trim()
-    if (q === "") return
+  function eqStartSearch(q) {
     s.eqSearching = true
-    s.eqSearchResults = []
-    s.eqError = ""
     eqSearchProc.command = [s.eqHelper, "search", q]
     eqSearchProc.running = true
+  }
+
+  function eqSearch(query) {
+    var q = String(query || "").trim()
+    s.eqError = ""
+    if (q === "") {
+      s.eqPendingQuery = ""
+      eqSearchProc.running = false
+      s.eqSearching = false
+      s.eqSearchResults = []
+      return
+    }
+    if (eqSearchProc.running) {
+      s.eqPendingQuery = q
+      eqSearchProc.running = false
+      return
+    }
+    s.eqStartSearch(q)
+  }
+
+  function eqSourcesRun(args) {
+    if (eqSourcesProc.running) return
+    s.eqSourcesBusy = true
+    eqSourcesProc.command = [s.eqHelper].concat(args)
+    eqSourcesProc.running = true
+  }
+
+  function eqLoadSources() { s.eqSourcesRun(["sources"]) }
+  function eqSourceAdd(kind, target, name) {
+    var a = ["source-add", String(kind), String(target)]
+    if (name) a.push(String(name))
+    s.eqSourcesError = ""
+    s.eqSourcesRun(a)
+  }
+  function eqSourceRemove(id) { s.eqSourcesRun(["source-remove", String(id)]) }
+  function eqSourceEnable(id, on) { s.eqSourcesRun(["source-enable", String(id), on ? "on" : "off"]) }
+  function eqSourceRefresh(id) {
+    var a = ["source-refresh"]
+    if (id) a.push(String(id))
+    s.eqSourcesRun(a)
+  }
+
+  // A result from a search: the name carries the provider, because the same
+  // headphone is published by several and they must not overwrite each other.
+  function eqApplyResult(r) {
+    var args = ["apply", String(r.url), "--as", String(r.name) + " (" + String(r.provider) + ")"]
+    s.eqRun(args)
   }
 
   function eqImport(url, name) {
@@ -392,6 +461,87 @@ Item {
     if (!capProc.running) capProc.running = true
   }
 
+  // ---------------------------------------------------- rate registration
+  // `--status` is the read-only view of what is written and what is live; the
+  // three writing modes run as tracked processes so the page can say it is
+  // working and show a refusal instead of silently doing nothing.
+  property var capStatus: ({})
+  property bool capBusy: false
+  property string capMessage: ""
+
+  readonly property var liveAllowed: {
+    var l = capStatus.liveAllowedRates
+    if (l && l.length) return l
+    return (report.policy && report.policy.allowedRates) || []
+  }
+  readonly property bool filesOurs: {
+    var f = capStatus.files
+    return !!f && ((f.global && f.global.state === "ours") || (f.device && f.device.state === "ours"))
+  }
+  readonly property bool needsLive: capStatus.rulesExpected === true && capStatus.rulesLanded !== true
+  readonly property var unregisteredRates: {
+    var out = []
+    for (var i = 0; i < hardwareRates.length; i++)
+      if (liveAllowed.indexOf(hardwareRates[i]) === -1) out.push(hardwareRates[i])
+    return out
+  }
+  // What the device says it can do; when it says nothing, the rates the clock
+  // may switch between, which the helper will refuse if the device cannot take them.
+  readonly property var rateChoices: hardwareRates.length > 0 ? hardwareRates : liveAllowed
+
+  Process {
+    id: capStatusProc
+    command: ["audio-capability", "--status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw === "") return
+        try { s.capStatus = JSON.parse(raw) } catch (e) {}
+      }
+    }
+  }
+
+  Process {
+    id: capActProc
+    command: []
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text || "").trim().split("\n")
+        s.capMessage = lines.length ? lines[lines.length - 1] : ""
+      }
+    }
+    onExited: function(code) {
+      s.capBusy = false
+      if (code === 0) s.capMessage = ""
+      s.refreshReport()
+      s.refreshStatus()
+    }
+  }
+
+  function refreshStatus() {
+    if (!capStatusProc.running) capStatusProc.running = true
+  }
+
+  function capAct(command) {
+    if (s.capBusy) return
+    s.capBusy = true
+    s.capMessage = ""
+    capActProc.command = command
+    capActProc.running = true
+  }
+
+  function registerRates() { capAct(["audio-capability", "--apply"]) }
+  function makeLive() { capAct(["audio-capability", "--activate"]) }
+  function removeRegistration() { capAct(["audio-capability", "--revert"]) }
+
+  // A rate the clock is not yet allowed to reach has to be registered first;
+  // the helper refuses to pin one that is not.
+  function registerAndPin(rate) {
+    capAct(["bash", "-c", 'audio-capability --apply && audio-capability --rate "$1"', "_", String(rate)])
+  }
+
   function runCap(args) {
     Quickshell.execDetached(["audio-capability"].concat(args))
     capSettle.restart()
@@ -409,14 +559,6 @@ Item {
     runCap(["--codec-pref", String(arg)])
   }
 
-  function applyFullRate() {
-    runCap(["--apply"])
-  }
-
-  function activateFullRate() {
-    runCap(["--activate"])
-  }
-
   Timer {
     id: capSettle
     interval: 900
@@ -432,6 +574,7 @@ Item {
 
   Component.onCompleted: {
     refreshReport()
+    refreshStatus()
     refreshEq()
     eqListProfiles()
   }

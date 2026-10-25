@@ -8,6 +8,9 @@
 #   audio-eq on | off | toggle
 #   audio-eq import <url|path> [name]
 #   audio-eq search <query>
+#   audio-eq sources
+#   audio-eq source-add <github|json|folder> <target> [name]
+#   audio-eq source-remove <id> | source-enable <id> on|off | source-refresh [id]
 #
 # One JSON object on stdout. Profiles are AutoEQ ParametricEQ.txt files or the
 # built-in presets in ~/.config/deck/eq/profiles.
@@ -32,12 +35,12 @@ UNIT="$UNIT_DIR/deck-eq.service"
 STATE_DIR="$STATE_HOME/deck"
 STATE="$STATE_DIR/eq.json"
 PROFILE_DIR="$CONFIG_HOME/deck/eq/profiles"
-INDEX="$CACHE_HOME/deck/autoeq-index.json"
+INDEX_DIR="$CACHE_HOME/deck/eq-index"
+SOURCES="$CONFIG_HOME/deck/eq/sources.json"
 SINK="deck_eq"
 OUTPUT="deck_eq_output"
 SERVICE="deck-eq.service"
 
-AUTOEQ_API="https://api.github.com/repos/jaakkopasanen/AutoEq/git/trees/master?recursive=1"
 AUTOEQ_RAW="https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/"
 
 fail() {
@@ -81,6 +84,93 @@ P
 init_builtins
 
 name_of() { basename "$1" .txt; }
+
+# ---------------------------------------------------------------- sources
+# A source is somewhere profiles can be found. Three kinds:
+#   github  owner/repo[@branch] laid out like AutoEq: results/INDEX.md plus
+#           results/<provider>/<category>/<name>/<name> ParametricEQ.txt.
+#           Upstream AutoEq is one of these and already carries about twenty
+#           providers (crinacle, oratory1990, Rtings, ...), so the provider is
+#           read from the path, not from the source.
+#   json    an address returning [{name, url, provider?, category?}]
+#   folder  a directory of ParametricEQ.txt files on this machine
+save_sources() { printf '%s\n' "$1" > "$SOURCES.tmp" && mv "$SOURCES.tmp" "$SOURCES"; }
+
+ensure_sources() {
+  mkdir -p "$(dirname "$SOURCES")"
+  if [[ ! -s $SOURCES ]] || ! jq -e 'type == "array"' "$SOURCES" >/dev/null 2>&1; then
+    save_sources '[{"id":"autoeq","name":"AutoEq","kind":"github","target":"jaakkopasanen/AutoEq@master","enabled":true,"builtin":true}]'
+  fi
+}
+
+sources_json() {
+  local idx
+  idx="$(for f in "$INDEX_DIR"/*.json; do
+      [[ -s $f ]] || continue
+      printf '%s\t%s\t%s\n' "$(basename "$f" .json)" "$(jq 'length' "$f" 2>/dev/null || echo 0)" "$(date -r "$f" +%s)"
+    done | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")
+        | {key: .[0], value: {count: (.[1]|tonumber), updated: (.[2]|tonumber)}}) | from_entries')"
+  [[ -n $idx ]] || idx="{}"
+  jq -c --argjson idx "$idx" '{ok:true, sources: map(. + ($idx[.id] // {count:0, updated:0}))}' "$SOURCES"
+}
+
+# Writes $INDEX_DIR/<id>.json: [{name, provider, category, url, source, sourceName}]
+build_index() {
+  local id="$1" kind target name repo branch out tmp
+  mkdir -p "$INDEX_DIR"
+  kind="$(jq -r --arg id "$id" '.[]|select(.id==$id)|.kind' "$SOURCES")"
+  target="$(jq -r --arg id "$id" '.[]|select(.id==$id)|.target' "$SOURCES")"
+  name="$(jq -r --arg id "$id" '.[]|select(.id==$id)|.name' "$SOURCES")"
+  [[ -n $kind ]] || { echo "no source named $id" >&2; return 1; }
+  out="$INDEX_DIR/$id.json"; tmp="$(mktemp)"
+  case "$kind" in
+    github)
+      repo="${target%%@*}"; branch="master"; [[ $target == *@* ]] && branch="${target#*@}"
+      local base="https://raw.githubusercontent.com/$repo/$branch/"
+      curl -fsL --max-time 60 "${base}results/INDEX.md" -o "$tmp.md" \
+        || { rm -f "$tmp" "$tmp.md"; echo "could not read ${base}results/INDEX.md" >&2; return 1; }
+      # "- [Name](./provider/category/Name) by provider ..." -> name, path
+      awk -F'\\]\\(\\./' '/^- \[/ {
+        n=$1; sub(/^- \[/, "", n); p=$2
+        if (!sub(/\) by [^)]*$/, "", p)) sub(/\)$/, "", p)
+        if (n != "" && p != "") printf "%s\t%s\n", n, p }' "$tmp.md" > "$tmp.tsv"
+      jq -R -s -c --arg base "$base" --arg id "$id" --arg sn "$name" '
+        split("\n") | map(select(length > 0) | split("\t") | . as $r
+          | ($r[1] | split("/")) as $p
+          | select($p | length >= 2)
+          | {name: $r[0],
+             provider: ($p[0] | gsub("%20"; " ")),
+             category: ($p[1] | gsub("%20"; " ")),
+             url: ($base + "results/" + $r[1] + "/" + $p[-1] + "%20ParametricEQ.txt"),
+             source: $id, sourceName: $sn})
+        | unique_by(.url)' "$tmp.tsv" > "$tmp" || { rm -f "$tmp" "$tmp.md" "$tmp.tsv"; echo "could not build the index" >&2; return 1; }
+      rm -f "$tmp.md" "$tmp.tsv" ;;
+    json)
+      curl -fsL --max-time 60 "$target" -o "$tmp.raw" \
+        || { rm -f "$tmp" "$tmp.raw"; echo "could not download $target" >&2; return 1; }
+      jq -c --arg id "$id" --arg sn "$name" '
+        (if type == "array" then . else (.profiles // .results // []) end)
+        | map(select(type == "object" and (.name|type) == "string" and (.url|type) == "string")
+          | {name, provider: (.provider // .source // $sn), category: (.category // ""), url,
+             source: $id, sourceName: $sn})' "$tmp.raw" > "$tmp" \
+        || { rm -f "$tmp" "$tmp.raw"; echo "that address did not return a list of profiles" >&2; return 1; }
+      rm -f "$tmp.raw" ;;
+    folder)
+      find "$target" -type f -iname '*.txt' -print0 2>/dev/null \
+        | xargs -0 -r grep -l '^Filter' 2>/dev/null \
+        | jq -R -s -c --arg root "$target" --arg id "$id" --arg sn "$name" '
+            split("\n") | map(select(length > 0)
+              | (sub("^" + $root + "/?"; "") | split("/")) as $p
+              | {name: ($p[-1] | sub(" ?ParametricEQ"; "") | sub("\\.txt$"; "")),
+                 provider: $sn, category: (if ($p|length) > 1 then $p[:-1]|join("/") else "" end),
+                 url: ($root + "/" + ($p|join("/"))), source: $id, sourceName: $sn})' > "$tmp" \
+        || { rm -f "$tmp"; echo "could not read that folder" >&2; return 1; } ;;
+  esac
+  if [[ $(jq 'length' "$tmp" 2>/dev/null || echo 0) -eq 0 ]]; then
+    rm -f "$tmp"; echo "that source has no profiles I can read" >&2; return 1
+  fi
+  mv "$tmp" "$out"
+}
 
 # AutoEQ ParametricEQ.txt -> {name, preamp, bands:[{type,fc,gain,q}]}
 parse_profile() {
@@ -245,15 +335,18 @@ save_state() { printf '%s\n' "$1" > "$STATE"; }
 last_profile() { jq -r '.profile // "Flat"' <<< "$(load_state)"; }
 
 resolve_profile() {
-  local want="$1" name file
+  local want="$1" name="${2:-}" file
   if [[ $want =~ ^https?:// ]]; then
-    name="$(basename "${want%%\?*}")"
-    name="${name//%20/ }"
-    name="${name% ParametricEQ.txt}"
-    name="${name%.txt}"
+    if [[ -z $name ]]; then
+      name="$(basename "${want%%\?*}")"
+      name="${name//%20/ }"
+      name="${name% ParametricEQ.txt}"
+      name="${name%.txt}"
+    fi
+    name="${name//\//-}"
     [[ -n $name && $name != ParametricEQ ]] || name="Imported EQ"
     file="$PROFILE_DIR/$name.txt"
-    curl -fsSL --max-time 20 "$want" -o "$file" || fail "could not download $want"
+    curl -fsL --max-time 20 "$want" -o "$file" || fail "could not download $want"
     grep -q '^Filter' "$file" || { rm -f "$file"; fail "that file has no AutoEQ filter lines"; }
     printf '%s\n' "$file"
     return
@@ -392,16 +485,17 @@ case "${1:-status}" in
   apply)
     want="${2:-}"; [[ -n $want ]] || fail "usage: audio-eq apply <profile|url>"
     shift 2
-    pre=""; gains=""; bands_json=""
+    pre=""; gains=""; bands_json=""; as_name=""
     while (($#)); do
       case "$1" in
         --preamp) pre="${2:?}"; shift 2 ;;
         --gains) gains="${2:-}"; shift 2 ;;
         --bands-json) bands_json="${2:?}"; shift 2 ;;
+        --as) as_name="${2:?}"; shift 2 ;;
         *) fail "unknown option $1" ;;
       esac
     done
-    file="$(resolve_profile "$want")"
+    file="$(resolve_profile "$want" "$as_name")"
     profile="$(name_of "$file")"
     json="$(parse_profile "$file" "$profile")"
     if [[ -n $pre ]]; then json="$(jq -c --argjson p "$pre" '.preamp=$p' <<< "$json")"; fi
@@ -447,7 +541,7 @@ case "${1:-status}" in
     name="${3:-}"
     if [[ $want =~ ^https?:// ]]; then
       tmp="$(mktemp)"
-      curl -fsSL --max-time 20 "$want" -o "$tmp" || fail "could not download $want"
+      curl -fsL --max-time 20 "$want" -o "$tmp" || fail "could not download $want"
       [[ -n $name ]] || name="$(basename "${want%%\?*}" .txt)"
       [[ -n $name ]] || name="Imported EQ"
       grep -q '^Filter' "$tmp" || { rm -f "$tmp"; fail "that file has no AutoEQ filter lines"; }
@@ -462,39 +556,83 @@ case "${1:-status}" in
 
   search)
     q="${2:-}"; [[ -n $q ]] || fail "usage: audio-eq search <query>"
-    if [[ ! -s $INDEX ]] || [[ $(find "$INDEX" -mtime +7 2>/dev/null) ]]; then
-      mkdir -p "$(dirname "$INDEX")"
-      tmp_md="$(mktemp)"; tmp_tsv="$(mktemp)"
-      trap 'rm -f "$tmp_md" "$tmp_tsv"' RETURN
-      curl -fsSL --max-time 60 \
-        "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/INDEX.md" \
-        -o "$tmp_md" || fail "could not fetch the AutoEQ index"
+    ensure_sources
+    mkdir -p "$INDEX_DIR"
+    # Build whatever is missing or a week old; a source that cannot be reached
+    # costs its own results and is reported, not the whole search.
+    failed=()
+    while IFS= read -r id; do
+      f="$INDEX_DIR/$id.json"
+      if [[ ! -s $f ]] || [[ $(find "$f" -mtime +7 2>/dev/null) ]]; then
+        build_index "$id" >/dev/null 2>&1 || failed+=("$id")
+      fi
+    done < <(jq -r '.[] | select(.enabled) | .id' "$SOURCES")
+    files=()
+    while IFS= read -r id; do
+      [[ -s $INDEX_DIR/$id.json ]] && files+=("$INDEX_DIR/$id.json")
+    done < <(jq -r '.[] | select(.enabled) | .id' "$SOURCES")
+    [[ ${#files[@]} -gt 0 ]] || fail "no source could be read; check Manage sources"
+    jq -c -s --arg q "$(tr '[:upper:]' '[:lower:]' <<< "$q")" --argjson failed "$(printf '%s\n' "${failed[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" '
+      ($q | split(" ") | map(select(length > 0))) as $t
+      | (add // []) as $all
+      | { failed: $failed,
+          results: [ $all[]
+            | ((.name + " " + .provider + " " + .category + " " + .sourceName) | ascii_downcase) as $h
+            | select($t | all(. as $w | $h | contains($w)))
+            | . + {rank: (if ((.name|ascii_downcase) | startswith($t[0])) then 0 else 1 end)} ]
+          | sort_by(.rank, .name) | .[:400] | map(del(.rank)) }' "${files[@]}" ;;
 
-      while IFS= read -r line; do
-        case "$line" in '- ['*) ;; *) continue ;; esac
-        line="${line% by *}"
-        name="${line#*[}"; name="${name%%]*}"
-        rest="${line#*](./}"; path="${rest%)}"
-        [[ -n $name && -n $path ]] || continue
-        printf '%s\t%s\n' "$name" "$path"
-      done < "$tmp_md" > "$tmp_tsv"
+  sources) ensure_sources; sources_json ;;
 
-      jq -R -s -c --arg base "$AUTOEQ_RAW" '
-        split("\n") | map(select(length > 0) | split("\t")
-          | . as $r
-          | ($r[1] | split("/")) as $p
-          | {name: $r[0],
-             source: ($p[0] | gsub("%20"; " ")),
-             category: ($p[1] | gsub("%20"; " ")),
-             url: ($base + "results/" + $r[1] + "/" + $p[-1] + "%20ParametricEQ.txt")})
-        | unique_by(.url)' "$tmp_tsv" > "$INDEX" \
-        || fail "could not build the AutoEQ index"
+  source-add)
+    kind="${2:-}"; target="${3:-}"; name="${4:-}"
+    [[ -n $kind && -n $target ]] || fail "usage: audio-eq source-add <github|json|folder> <target> [name]"
+    case "$kind" in
+      github)
+        target="${target#https://github.com/}"; target="${target%/}"; target="${target%.git}"
+        [[ $target =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(@[A-Za-z0-9_./-]+)?$ ]] \
+          || fail "a GitHub source looks like owner/repo or owner/repo@branch" ;;
+      json) [[ $target =~ ^https?:// ]] || fail "a JSON source needs an http(s) address" ;;
+      folder) target="${target/#\~/$HOME}"; [[ -d $target ]] || fail "no such folder: $target" ;;
+      *) fail "source kind must be github, json or folder" ;;
+    esac
+    ensure_sources
+    [[ -n $name ]] || name="$(basename "${target%%@*}")"
+    id="$(tr '[:upper:] ' '[:lower:]-' <<< "$name" | tr -cd 'a-z0-9-')"
+    [[ -n $id ]] || id="source"
+    base="$id"; n=2
+    while jq -e --arg id "$id" 'any(.[]; .id == $id)' "$SOURCES" >/dev/null; do id="$base-$n"; n=$((n+1)); done
+    save_sources "$(jq -c --arg id "$id" --arg name "$name" --arg kind "$kind" --arg target "$target" \
+      '. + [{id:$id, name:$name, kind:$kind, target:$target, enabled:true, builtin:false}]' "$SOURCES")"
+    if ! err="$(build_index "$id" 2>&1)"; then
+      save_sources "$(jq -c --arg id "$id" 'map(select(.id != $id))' "$SOURCES")"
+      rm -f "$INDEX_DIR/$id.json"
+      fail "${err:-that source has no profiles I can read}"
     fi
-    jq -c --arg q "$(tr '[:upper:]' '[:lower:]' <<< "$q")" '
-      [ .[] | select(
-          ((.name|ascii_downcase) | contains($q))
-          or ((.source|ascii_downcase) | contains($q))
-          or ((.category|ascii_downcase) | contains($q))) ][:30]' "$INDEX" ;;
+    sources_json ;;
 
-  *) fail "usage: audio-eq status|list|apply|on|off|toggle|import|search" ;;
+  source-remove)
+    id="${2:-}"; ensure_sources
+    jq -e --arg id "$id" 'any(.[]; .id == $id and (.builtin | not))' "$SOURCES" >/dev/null \
+      || fail "no removable source named $id"
+    save_sources "$(jq -c --arg id "$id" 'map(select(.id != $id))' "$SOURCES")"
+    rm -f "$INDEX_DIR/$id.json"
+    sources_json ;;
+
+  source-enable)
+    id="${2:-}"; val="${3:-}"; ensure_sources
+    [[ $val == on || $val == off ]] || fail "usage: audio-eq source-enable <id> on|off"
+    jq -e --arg id "$id" 'any(.[]; .id == $id)' "$SOURCES" >/dev/null || fail "no source named $id"
+    save_sources "$(jq -c --arg id "$id" --argjson on "$([[ $val == on ]] && echo true || echo false)" \
+      'map(if .id == $id then .enabled = $on else . end)' "$SOURCES")"
+    sources_json ;;
+
+  source-refresh)
+    ensure_sources
+    ids="${2:-}"
+    [[ -n $ids ]] || ids="$(jq -r '.[] | select(.enabled) | .id' "$SOURCES")"
+    for id in $ids; do build_index "$id" >/dev/null 2>&1 || true; done
+    sources_json ;;
+
+  *) fail "usage: audio-eq status|list|apply|on|off|toggle|import|search|sources|source-*" ;;
 esac

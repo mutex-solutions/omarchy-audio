@@ -45,13 +45,67 @@ Item {
     return out
   }
 
-  property bool rateOpen: false
-  property bool codecOpen: false
+  property bool ratePickOpen: false
+  property bool codecPickOpen: false
+  property bool prefPickOpen: false
+  property bool qualPickOpen: false
+  property bool bitPickOpen: false
+  property bool removeArmed: false
+
+  Timer {
+    id: removeDisarm
+    interval: 3500
+    onTriggered: page.removeArmed = false
+  }
+
+  readonly property var rateRows: {
+    var out = [{ text: "Auto, follows what is playing", rate: 0, registered: true,
+                 current: !!page.state && page.state.forcedRate === 0 }]
+    if (!page.state) return out
+    var list = page.state.rateChoices
+    for (var i = 0; i < list.length; i++) {
+      var reg = page.state.liveAllowed.indexOf(list[i]) !== -1
+      out.push({ text: page.state.fmtHz(list[i]) + (reg ? "" : "  · not registered"),
+                 rate: list[i], registered: reg, current: page.state.forcedRate === list[i] })
+    }
+    return out
+  }
+  readonly property var codecRows: {
+    var out = []
+    var list = page.state ? (page.state.bt.known || []) : []
+    for (var i = 0; i < list.length; i++)
+      out.push({ text: String(list[i]).toUpperCase(), value: list[i],
+                 current: page.state.bt.current === list[i] })
+    return out
+  }
+  readonly property var prefRows: {
+    var out = [{ text: "No preference", value: "", current: !!page.state && (page.state.bt.preferred || []).length === 0 }]
+    var list = page.state ? (page.state.bt.known || []) : []
+    for (var i = 0; i < list.length; i++)
+      out.push({ text: String(list[i]).toUpperCase(), value: list[i],
+                 current: (page.state.bt.preferred || [])[0] === list[i] })
+    return out
+  }
+  readonly property var qualRows: {
+    var q = page.state ? page.state.bt.ldacQuality : null
+    return [["auto", "Auto"], ["hq", "High quality"], ["sq", "Standard"], ["mq", "Connection first"]]
+      .map(function(r) { return { text: r[1], value: r[0], current: q === r[0] } })
+  }
+  readonly property var bitRows: {
+    var b = page.state ? page.state.bt.aacBitrateMode : null
+    var out = []
+    for (var i = 0; i <= 5; i++)
+      out.push({ text: "Mode " + i + (i === 0 ? " (lowest)" : i === 5 ? " (highest)" : ""), value: i, current: b === i })
+    return out
+  }
 
   // ------------------------------------------------------------- equalizer
   property bool eqProfilesOpen: false
   property bool eqSearchOpen: false
   property string eqSearchText: ""
+  property var expandedGroups: ({})
+  property string addKind: "github"
+  property bool addPending: false
   property int bandRevision: 0
   property real eqPreampLocal: 0
   property bool eqDirty: false
@@ -137,14 +191,89 @@ Item {
     eqDirty = false
   }
 
-  function eqLookup() {
+  function isAddress(q) {
+    return q.indexOf("http://") === 0 || q.indexOf("https://") === 0
+  }
+
+  // Typing searches by itself once the text has been still for a second. A
+  // pasted address is the exception: it downloads a file, so it waits for Enter.
+  function runSearch() {
     if (!state) return
-    var q = String(eqSearchField.text || "").trim()
-    if (q === "") return
-    if (q.indexOf("http://") === 0 || q.indexOf("https://") === 0)
-      state.eqApply(q, null, [])
-    else
-      state.eqSearch(q)
+    var q = String(eqSearchText || "").trim()
+    if (isAddress(q)) return
+    state.eqSearch(q)
+  }
+
+  function importAddress() {
+    var q = String(eqSearchText || "").trim()
+    if (state && isAddress(q)) state.eqApply(q, null, [])
+  }
+
+  readonly property var searchGroups: {
+    var list = page.state ? page.state.eqSearchResults : []
+    var order = [], seen = {}
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i]
+      var k = String(r.provider)
+      if (seen[k] === undefined) {
+        seen[k] = order.length
+        order.push({ provider: k, source: String(r.sourceName), items: [] })
+      }
+      order[seen[k]].items.push(r)
+    }
+    return order
+  }
+
+  function toggleGroup(provider) {
+    var next = {}
+    for (var k in expandedGroups) next[k] = expandedGroups[k]
+    next[provider] = !(expandedGroups[provider] === true)
+    expandedGroups = next
+  }
+
+  function kindLabel(kind) {
+    return kind === "github" ? "GitHub" : kind === "json" ? "List" : "Folder"
+  }
+
+  function ago(t) {
+    var n = Number(t)
+    if (!(n > 0)) return "not fetched"
+    var d = Math.floor((Date.now() / 1000 - n) / 86400)
+    return d <= 0 ? "today" : d === 1 ? "yesterday" : d + " days ago"
+  }
+
+  Timer {
+    id: searchDebounce
+    interval: 1000
+    onTriggered: page.runSearch()
+  }
+
+  onEqSearchTextChanged: {
+    if (page.isAddress(String(eqSearchText).trim())) {
+      searchDebounce.stop()
+      if (state) state.eqSearch("")
+    } else {
+      searchDebounce.restart()
+    }
+  }
+
+  onViewChanged: {
+    if (!state) return
+    if (view === "sources") state.eqLoadSources()
+    else if (view === "eq" && String(eqSearchText).trim() !== "") runSearch()
+  }
+
+  Connections {
+    target: page.state
+    function onEqSourcesBusyChanged() {
+      if (!page.state.eqSourcesBusy && page.addPending) {
+        page.addPending = false
+        if (page.state.eqSourcesError === "") {
+          addTargetField.text = ""
+          addNameField.text = ""
+        }
+      }
+    }
   }
 
   // The input meter is a capture stream. Run it only while this page is on
@@ -675,18 +804,73 @@ Item {
     }
   }
 
+  // A single-line text box with the page's side margin built in.
+  component Field: Item {
+    id: field
+    property alias text: input.text
+    property string placeholder: ""
+    signal accepted()
+
+    width: parent ? parent.width : 0
+    height: Style.space(26)
+
+    Rectangle {
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(8)
+      anchors.rightMargin: Style.space(8)
+      radius: Style.cornerRadius
+      color: Util.alpha(Color.foreground, 0.05)
+      border.width: 1
+      border.color: input.activeFocus
+        ? Util.alpha(Color.accent, 0.7)
+        : Util.alpha(Color.foreground, 0.22)
+    }
+
+    Text {
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(15)
+      anchors.rightMargin: Style.space(15)
+      verticalAlignment: Text.AlignVCenter
+      visible: input.text === ""
+      text: field.placeholder
+      color: Util.alpha(Color.foreground, 0.35)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+
+    TextInput {
+      id: input
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(15)
+      anchors.rightMargin: Style.space(15)
+      verticalAlignment: TextInput.AlignVCenter
+      color: Color.foreground
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+      clip: true
+      selectByMouse: true
+      onAccepted: field.accepted()
+    }
+  }
+
   component Chip: Rectangle {
     id: chip
     property string label: ""
+    property bool selected: false
     signal picked()
 
     width: chipText.implicitWidth + Style.space(16)
     height: Style.space(22)
     radius: Style.cornerRadius
     property bool hovered: false
-    color: chip.hovered ? Util.alpha(Color.accent, Style.hoverFillAlpha) : "transparent"
+    color: chip.selected
+      ? Util.alpha(Color.accent, Style.selectedFillAlpha)
+      : chip.hovered ? Util.alpha(Color.accent, Style.hoverFillAlpha) : "transparent"
     border.width: 1
-    border.color: Util.alpha(Color.foreground, Style.normalBorderAlpha)
+    border.color: chip.selected
+      ? Util.alpha(Color.accent, 0.55)
+      : Util.alpha(Color.foreground, Style.normalBorderAlpha)
 
     Text {
       id: chipText
@@ -1019,14 +1203,16 @@ Item {
           ? (page.state.isBluetooth ? page.state.codecLabel : page.state.fmtHz(page.state.inUseRate))
           : ""
         open: page.advOpen
-        onToggled: page.advOpen = !page.advOpen
+        onToggled: {
+          page.advOpen = !page.advOpen
+          if (page.advOpen && page.state) page.state.refreshStatus()
+        }
       }
 
       Column {
         width: parent.width
-        spacing: Style.space(2)
+        spacing: Style.space(4)
         visible: page.advOpen
-
 
         // The codec and clock come from the audio-capability helper. Without it,
         // say so once rather than drawing controls that cannot act.
@@ -1042,304 +1228,219 @@ Item {
           font.pixelSize: Style.font.caption
         }
 
-        // Sample rate. `clock.force-rate` is the lever that acts now: 0 is Auto.
-        Item {
-          width: parent.width
-          height: Style.space(30)
+        Caps {
           visible: page.state && page.state.reportLoaded
+          leftPadding: Style.space(8)
+          text: "SAMPLE RATE"
+        }
 
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: page.rateOpen = !page.rateOpen
-          }
-
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Sample rate"
-            color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-          }
-
-          Text {
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: (page.state ? page.state.rateLabel : "") + "  ▾"
-            color: Util.alpha(Color.foreground, 0.7)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+        // `clock.force-rate` is the lever that acts now: 0 is Auto. A rate the
+        // device offers but the clock may not reach is listed too, marked, and
+        // choosing it registers it first.
+        Pick {
+          visible: page.state && page.state.reportLoaded
+          glyph: "󰒓"
+          text: page.state ? page.state.rateLabel : ""
+          open: page.ratePickOpen
+          rows: page.rateRows
+          onToggled: page.ratePickOpen = !page.ratePickOpen
+          onChosen: function(i) {
+            page.ratePickOpen = false
+            var r = page.rateRows[i]
+            if (!page.state) return
+            if (r.rate === 0) page.state.setRate("auto")
+            else if (r.registered) page.state.setRate(r.rate)
+            else page.state.registerAndPin(r.rate)
           }
         }
 
-        Column {
+        Text {
+          visible: page.state && page.state.reportLoaded && page.state.hardwareRates.length === 0
           width: parent.width
-          spacing: 0
-          visible: page.rateOpen && page.state && page.state.reportLoaded
-
-          Repeater {
-            model: [0].concat(page.state ? page.state.rateOptions : [])
-
-            delegate: Item {
-              required property var modelData
-              readonly property bool current: page.state
-                && (modelData === 0 ? page.state.forcedRate === 0
-                                    : page.state.forcedRate === modelData)
-
-              width: col.width
-              height: Style.space(26)
-
-              Rectangle {
-                anchors.fill: parent
-                color: parent.current ? Util.alpha(Color.accent, Style.selectedFillAlpha) : "transparent"
-              }
-
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(20)
-                anchors.verticalCenter: parent.verticalCenter
-                text: modelData === 0
-                  ? "Auto, follows what is playing"
-                  : (page.state ? page.state.fmtHz(modelData) : "")
-                color: parent.current ? Color.accent : Color.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  if (page.state) page.state.setRate(modelData === 0 ? "auto" : modelData)
-                  page.rateOpen = false
-                }
-              }
-            }
-          }
+          wrapMode: Text.WordWrap
+          leftPadding: Style.space(10)
+          rightPadding: Style.space(10)
+          text: "This device does not list its rates. The ones below are what PipeWire may switch between; any the device cannot take is refused."
+          color: Util.alpha(Color.foreground, 0.4)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
         }
 
-        // The device advertises rates the clock is not allowed to reach. The
-        // helper owns the two files that fix that; this offers them, labelled.
-        Item {
-          width: parent.width
-          height: Style.space(30)
-          visible: page.state && page.state.canApplyRates
+        // ---- registry: what PipeWire has been told it may use ----
+        Caps {
+          visible: page.state && page.state.reportLoaded
+          topPadding: Style.space(6)
+          leftPadding: Style.space(8)
+          text: "REGISTERED RATES"
+        }
 
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Allow the hardware's rates"
-            color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-            elide: Text.ElideRight
-            width: parent.width - applyChip.width - Style.space(20)
+        Text {
+          visible: page.state && page.state.reportLoaded
+          width: parent.width
+          wrapMode: Text.WordWrap
+          leftPadding: Style.space(10)
+          rightPadding: Style.space(10)
+          text: page.state && page.state.liveAllowed.length > 0
+            ? page.state.liveAllowed.map(function(r) { return Math.round(r / 100) / 10 }).join(", ") + " kHz"
+            : "None; PipeWire stays at its default rate"
+          color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: page.state && page.state.reportLoaded
+          width: parent.width
+          wrapMode: Text.WordWrap
+          leftPadding: Style.space(10)
+          rightPadding: Style.space(10)
+          text: {
+            if (!page.state) return ""
+            if (page.state.capBusy) return "Working…"
+            if (page.state.unregisteredRates.length > 0)
+              return page.state.unregisteredRates.length + " rates this device offers are not registered"
+            if (page.state.needsLive)
+              return "Written, not live yet. Make live restarts WirePlumber and audio pauses for a moment."
+            if (page.state.filesOurs) return "Registered by this panel"
+            return "Nothing registered by this panel"
+          }
+          color: Util.alpha(Color.foreground, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        Flow {
+          visible: page.state && page.state.reportLoaded
+          width: parent.width - Style.space(16)
+          x: Style.space(8)
+          spacing: Style.space(6)
+
+          Chip {
+            label: "Discover"
+            onPicked: if (page.state) { page.state.refreshReport(); page.state.refreshStatus() }
           }
 
           Chip {
-            id: applyChip
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            label: "Apply"
-            onPicked: if (page.state) page.state.applyFullRate()
-          }
-        }
-
-        Item {
-          width: parent.width
-          height: Style.space(26)
-          visible: page.state && page.state.canApplyRates
-
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Then restart WirePlumber to pick the rules up"
-            color: Util.alpha(Color.foreground, 0.45)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            visible: page.state && (page.state.unregisteredRates.length > 0 || !page.state.filesOurs)
+            label: "Register"
+            onPicked: if (page.state) page.state.registerRates()
           }
 
           Chip {
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            label: "Restart"
-            onPicked: if (page.state) page.state.activateFullRate()
-          }
-        }
-
-        // Bluetooth codec. The row's press switches the open link; the pin writes
-        // a preference for the next connect. They are different mechanisms.
-        Item {
-          width: parent.width
-          height: Style.space(30)
-          visible: page.state ? page.state.isBluetooth : false
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: page.codecOpen = !page.codecOpen
+            visible: page.state && page.state.needsLive
+            label: "Make live"
+            onPicked: if (page.state) page.state.makeLive()
           }
 
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "Codec"
-            color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-          }
-
-          Text {
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: (page.state ? page.state.codecLabel : "") + "  ▾"
-            color: Util.alpha(Color.foreground, 0.7)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-        }
-
-        Column {
-          width: parent.width
-          spacing: 0
-          visible: page.state && page.state.isBluetooth && page.codecOpen
-
-          Repeater {
-            model: page.state ? (page.state.bt.known || []) : []
-
-            delegate: Item {
-              required property var modelData
-              readonly property bool current: page.state && page.state.bt.current === modelData
-              readonly property bool prefer: page.state
-                && (page.state.bt.preferred || []).indexOf(modelData) !== -1
-
-              width: col.width
-              height: Style.space(28)
-
-              Rectangle {
-                anchors.fill: parent
-                color: parent.current ? Util.alpha(Color.accent, Style.selectedFillAlpha) : "transparent"
-              }
-
-              Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(20)
-                anchors.right: preferChip.left
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                text: String(modelData).toUpperCase()
-                  + (parent.current ? "  · in use" : "")
-                  + (parent.prefer ? "  · preferred" : "")
-                color: parent.current ? Color.accent : Color.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-
-              Chip {
-                id: preferChip
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                label: "prefer"
-                onPicked: if (page.state) page.state.setCodecPref("codec=" + modelData)
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                anchors.rightMargin: Style.space(60)
-                cursorShape: Qt.PointingHandCursor
-                onClicked: if (page.state) page.state.setCodec(modelData)
-              }
-            }
-          }
-        }
-
-        Item {
-          width: parent.width
-          height: Style.space(30)
-          visible: page.state ? page.state.isBluetooth : false
-
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "LDAC quality"
-            color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-          }
-
-          Text {
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: page.state && page.state.qualityLabel !== ""
-              ? page.state.qualityLabel : "next connect"
-            color: Util.alpha(Color.foreground, 0.6)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
+          Chip {
+            visible: page.state && page.state.filesOurs
+            label: page.removeArmed ? "Confirm remove" : "Remove"
+            onPicked: {
               if (!page.state) return
-              var q = page.state.bt.ldacQuality
-              var next = q === "auto" ? "hq" : q === "hq" ? "sq" : q === "sq" ? "mq" : "auto"
-              page.state.setCodecPref("quality=" + next)
+              if (page.removeArmed) {
+                page.removeArmed = false
+                page.state.removeRegistration()
+              } else {
+                page.removeArmed = true
+                removeDisarm.restart()
+              }
             }
           }
         }
 
-        Item {
+        Text {
+          visible: page.state && page.state.capMessage !== ""
           width: parent.width
-          height: Style.space(30)
+          wrapMode: Text.WordWrap
+          leftPadding: Style.space(10)
+          rightPadding: Style.space(10)
+          text: page.state ? page.state.capMessage : ""
+          color: Color.urgent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+
+        // ---- Bluetooth codec: switch now, and prefer at the next connect ----
+        Caps {
+          visible: page.state && page.state.isBluetooth
+          topPadding: Style.space(6)
+          leftPadding: Style.space(8)
+          text: "CODEC, SWITCH NOW"
+        }
+
+        Pick {
           visible: page.state ? page.state.isBluetooth : false
-
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "AAC bitrate mode"
-            color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
+          glyph: "󰂯"
+          text: page.state ? page.state.codecLabel : ""
+          open: page.codecPickOpen
+          rows: page.codecRows
+          onToggled: page.codecPickOpen = !page.codecPickOpen
+          onChosen: function(i) {
+            page.codecPickOpen = false
+            if (page.state) page.state.setCodec(page.codecRows[i].value)
           }
+        }
 
-          Text {
-            anchors.right: parent.right
-            anchors.rightMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: page.state && page.state.bitrateLabel !== ""
-              ? page.state.bitrateLabel : "next connect"
-            color: Util.alpha(Color.foreground, 0.6)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+        Caps {
+          visible: page.state && page.state.isBluetooth
+          topPadding: Style.space(6)
+          leftPadding: Style.space(8)
+          text: "PREFER AT CONNECT"
+        }
+
+        Pick {
+          visible: page.state ? page.state.isBluetooth : false
+          glyph: "󰂯"
+          text: page.state && (page.state.bt.preferred || []).length > 0
+            ? String(page.state.bt.preferred[0]).toUpperCase() : "No preference"
+          open: page.prefPickOpen
+          rows: page.prefRows
+          onToggled: page.prefPickOpen = !page.prefPickOpen
+          onChosen: function(i) {
+            page.prefPickOpen = false
+            if (!page.state) return
+            var v = page.prefRows[i].value
+            page.state.setCodecPref(v === "" ? "none" : "codec=" + v)
           }
+        }
 
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              if (!page.state) return
-              var b = page.state.bt.aacBitrateMode
-              var next = (b === null || b === undefined || b >= 5) ? 0 : (b + 1)
-              page.state.setCodecPref("bitrate=" + next)
-            }
+        Caps {
+          visible: page.state && page.state.isBluetooth
+          topPadding: Style.space(6)
+          leftPadding: Style.space(8)
+          text: "LDAC QUALITY"
+        }
+
+        Pick {
+          visible: page.state ? page.state.isBluetooth : false
+          glyph: "󰂯"
+          text: page.state && page.state.qualityLabel !== "" ? page.state.qualityLabel : "Next connect"
+          open: page.qualPickOpen
+          rows: page.qualRows
+          onToggled: page.qualPickOpen = !page.qualPickOpen
+          onChosen: function(i) {
+            page.qualPickOpen = false
+            if (page.state) page.state.setCodecPref("quality=" + page.qualRows[i].value)
+          }
+        }
+
+        Caps {
+          visible: page.state && page.state.isBluetooth
+          topPadding: Style.space(6)
+          leftPadding: Style.space(8)
+          text: "AAC BITRATE MODE"
+        }
+
+        Pick {
+          visible: page.state ? page.state.isBluetooth : false
+          glyph: "󰂯"
+          text: page.state && page.state.bitrateLabel !== "" ? page.state.bitrateLabel : "Next connect"
+          open: page.bitPickOpen
+          rows: page.bitRows
+          onToggled: page.bitPickOpen = !page.bitPickOpen
+          onChosen: function(i) {
+            page.bitPickOpen = false
+            if (page.state) page.state.setCodecPref("bitrate=" + page.bitRows[i].value)
           }
         }
 
@@ -1374,7 +1475,6 @@ Item {
         }
 
       }
-
 
       Gap { }
 
@@ -1498,160 +1598,190 @@ Item {
       Fold {
         glyph: "󰖟"
         title: "Find online"
-        value: "AutoEQ"
+        value: page.state && page.state.eqSources.length > 0
+          ? page.state.eqSources.filter(function(x) { return x.enabled }).length + " sources" : ""
         open: page.eqSearchOpen
-        onToggled: page.eqSearchOpen = !page.eqSearchOpen
+        onToggled: {
+          page.eqSearchOpen = !page.eqSearchOpen
+          if (page.eqSearchOpen && page.state) page.state.eqLoadSources()
+        }
       }
 
       Column {
         width: parent.width
-        spacing: Style.space(2)
+        spacing: Style.space(4)
         visible: page.eqSearchOpen
 
-        Item {
-          width: parent.width
-          height: Style.space(20)
-
-          Text {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(8)
-            anchors.verticalCenter: parent.verticalCenter
-            text: "ONLINE · AUTO EQ"
-            color: Util.alpha(Color.foreground, 0.45)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            font.letterSpacing: 1.5
-          }
-
-        }
-
-        Text {
-          width: parent.width
-          height: Style.space(16)
-          leftPadding: Style.space(8)
-          verticalAlignment: Text.AlignVCenter
-          text: "Crinacle · oratory1990 · Super Review"
-          color: Util.alpha(Color.foreground, 0.38)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-        }
-
-        Rectangle {
-          width: parent.width
-          height: Style.space(26)
-          color: Util.alpha(Color.foreground, 0.05)
-          border.width: 1
-          border.color: Util.alpha(Color.foreground, 0.22)
-          radius: Style.cornerRadius
-
-          Text {
-            anchors.fill: parent
-            anchors.leftMargin: Style.space(7)
-            verticalAlignment: Text.AlignVCenter
-            visible: eqSearchField.text === ""
-            text: "Search a headphone model or source"
-            color: Util.alpha(Color.foreground, 0.35)
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-          }
-
-          TextInput {
-            id: eqSearchField
-            anchors.fill: parent
-            anchors.leftMargin: Style.space(7)
-            anchors.rightMargin: Style.space(7)
-            verticalAlignment: TextInput.AlignVCenter
-            color: Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            clip: true
-            selectByMouse: true
-            onAccepted: page.eqLookup()
-          }
-        }
-
-        Item {
-          width: parent.width
-          height: Style.space(24)
-
-          Chip {
-            anchors.left: parent.left
-            anchors.leftMargin: Style.space(16)
-            anchors.verticalCenter: parent.verticalCenter
-            label: page.state && page.state.eqSearching ? "Searching…" : "Find online"
-            onPicked: page.eqLookup()
+        Field {
+          placeholder: "Type a headphone model"
+          onTextChanged: page.eqSearchText = text
+          onAccepted: {
+            searchDebounce.stop()
+            if (page.isAddress(String(page.eqSearchText).trim())) page.importAddress()
+            else page.runSearch()
           }
         }
 
         Text {
-          visible: page.state && page.state.eqSearching
-            && page.state.eqSearchResults.length === 0
           width: parent.width
-          height: Style.space(20)
-          leftPadding: Style.space(16)
-          verticalAlignment: Text.AlignVCenter
-          text: "Searching AutoEQ…"
+          leftPadding: Style.space(10)
+          rightPadding: Style.space(10)
+          wrapMode: Text.WordWrap
+          visible: text !== ""
+          text: {
+            var q = String(page.eqSearchText).trim()
+            if (page.isAddress(q)) return "Press Enter to import this address"
+            if (page.state && page.state.eqSearching) return "Searching…"
+            if (q === "") return "Searches as you type, grouped by who measured it"
+            if (page.state && page.state.eqSearchResults.length === 0 && !searchDebounce.running)
+              return "No profiles found"
+            if (page.state && page.state.eqSearchResults.length > 0)
+              return page.state.eqSearchResults.length + " profiles from " + page.searchGroups.length + " providers"
+            return ""
+          }
           color: Util.alpha(Color.foreground, 0.4)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
 
         Text {
-          visible: page.state && !page.state.eqSearching
-            && page.state.eqSearchResults.length === 0
-            && eqSearchField.text !== ""
           width: parent.width
-          height: Style.space(20)
-          leftPadding: Style.space(16)
-          verticalAlignment: Text.AlignVCenter
-          text: "No profiles found"
-          color: Util.alpha(Color.foreground, 0.4)
+          leftPadding: Style.space(10)
+          rightPadding: Style.space(10)
+          wrapMode: Text.WordWrap
+          visible: page.state && page.state.eqSearchFailed.length > 0
+          text: page.state ? "Could not read: " + page.state.eqSearchFailed.join(", ") : ""
+          color: Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
 
         Repeater {
-          model: page.state ? page.state.eqSearchResults : []
+          model: page.searchGroups
 
-          delegate: Item {
+          delegate: Column {
+            id: group
             required property var modelData
+            readonly property bool expanded: page.expandedGroups[modelData.provider] === true
+              || page.searchGroups.length === 1
+            readonly property var shown: expanded ? modelData.items : modelData.items.slice(0, 3)
             width: col.width
-            height: Style.space(32)
+            spacing: 0
 
-            Column {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(16)
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: 1
+            Item {
+              width: parent.width
+              height: Style.space(24)
 
-              Text {
-                width: parent.width
-                text: String(modelData.name)
-                color: Color.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.body
-                elide: Text.ElideRight
+              Rectangle {
+                anchors.fill: parent
+                radius: Style.cornerRadius
+                color: groupMouse.containsMouse ? Util.alpha(Color.foreground, Style.hoverFillAlpha) : "transparent"
               }
 
               Text {
-                width: parent.width
-                text: String(modelData.source) + " · " + String(modelData.category)
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: group.modelData.provider.toUpperCase()
+                color: Util.alpha(Color.foreground, 0.6)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                font.letterSpacing: 1.2
+              }
+
+              Text {
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: group.modelData.items.length + (group.modelData.items.length > 3 ? (group.expanded ? "  ▾" : "  ▸") : "")
                 color: Util.alpha(Color.foreground, 0.45)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
+              }
+
+              MouseArea {
+                id: groupMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: page.toggleGroup(group.modelData.provider)
               }
             }
 
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                if (!page.state) return
-                page.state.eqApply(modelData.url, null, [])
+            Repeater {
+              model: group.shown
+
+              delegate: Item {
+                id: hit
+                required property var modelData
+                readonly property string fullName: String(modelData.name) + " (" + String(modelData.provider) + ")"
+                width: group.width
+                height: Style.space(26)
+
+                Rectangle {
+                  anchors.fill: parent
+                  radius: Style.cornerRadius
+                  color: hitMouse.containsMouse ? Util.alpha(Color.foreground, Style.hoverFillAlpha) : "transparent"
+                }
+
+                Text {
+                  id: hitCat
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.min(implicitWidth, parent.width * 0.38)
+                  horizontalAlignment: Text.AlignRight
+                  elide: Text.ElideRight
+                  text: String(hit.modelData.category)
+                  color: Util.alpha(Color.foreground, 0.4)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(16)
+                  anchors.right: hitCat.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideRight
+                  text: String(hit.modelData.name)
+                  color: page.state && page.state.eqProfile === hit.fullName ? Color.accent : Color.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                  id: hitMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: if (page.state) page.state.eqApplyResult(hit.modelData)
+                }
+              }
+            }
+
+            Item {
+              visible: !group.expanded && group.modelData.items.length > 3
+              width: parent.width
+              height: Style.space(22)
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(16)
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Show " + (group.modelData.items.length - 3) + " more"
+                color: moreMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.5)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: moreMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: page.toggleGroup(group.modelData.provider)
               }
             }
           }
@@ -1663,13 +1793,18 @@ Item {
           wrapMode: Text.Wrap
           leftPadding: Style.space(8)
           rightPadding: Style.space(8)
-          topPadding: Style.space(2)
           text: page.state ? page.state.eqError : ""
           color: Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
 
+        Fold {
+          glyph: "󰒓"
+          title: "Manage sources"
+          mark: "›"
+          onToggled: page.view = "sources"
+        }
       }
 
       Column {
@@ -1963,6 +2098,321 @@ Item {
           }
         }
       }
+
+    // ---- sources view ----
+    Column {
+      id: sourcesView
+      width: parent.width
+      spacing: Style.space(2)
+      visible: page.view === "sources"
+
+      Item {
+        width: parent.width
+        height: Style.space(32)
+
+        Text {
+          id: srcBack
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Audio"
+          color: srcBackMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.6)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.title
+
+          MouseArea {
+            id: srcBackMouse
+            anchors.fill: parent
+            anchors.margins: -Style.space(4)
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: page.view = "main"
+          }
+        }
+
+        Text {
+          id: srcCrumb1
+          anchors.left: srcBack.right
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "›"
+          color: Util.alpha(Color.foreground, 0.4)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.title
+        }
+
+        Text {
+          id: srcEq
+          anchors.left: srcCrumb1.right
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Equalizer"
+          color: srcEqMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.6)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.title
+
+          MouseArea {
+            id: srcEqMouse
+            anchors.fill: parent
+            anchors.margins: -Style.space(4)
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: page.view = "eq"
+          }
+        }
+
+        Text {
+          id: srcCrumb2
+          anchors.left: srcEq.right
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "›"
+          color: Util.alpha(Color.foreground, 0.4)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.title
+        }
+
+        Text {
+          anchors.left: srcCrumb2.right
+          anchors.leftMargin: Style.space(6)
+          anchors.verticalCenter: parent.verticalCenter
+          text: "Sources"
+          color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.title
+          font.bold: true
+        }
+      }
+
+      Text {
+        width: parent.width
+        leftPadding: Style.space(8)
+        rightPadding: Style.space(8)
+        wrapMode: Text.WordWrap
+        text: "Where Find online looks. One source can hold many providers; the results are grouped by provider."
+        color: Util.alpha(Color.foreground, 0.5)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Gap { }
+
+      Repeater {
+        model: page.state ? page.state.eqSources : []
+
+        delegate: Item {
+          id: srcRow
+          required property var modelData
+          width: col.width
+          height: Style.space(42)
+
+          Switch {
+            id: srcSwitch
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            checked: srcRow.modelData.enabled === true
+            onToggled: if (page.state) page.state.eqSourceEnable(srcRow.modelData.id, !srcRow.modelData.enabled)
+          }
+
+          Item {
+            id: srcTrail
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(40)
+            height: Style.space(22)
+
+            Text {
+              visible: srcRow.modelData.builtin === true
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: "built in"
+              color: Util.alpha(Color.foreground, 0.4)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              visible: srcRow.modelData.builtin !== true
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              text: "×"
+              color: srcDel.containsMouse ? Color.urgent : Util.alpha(Color.foreground, 0.6)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.title
+
+              MouseArea {
+                id: srcDel
+                anchors.fill: parent
+                anchors.margins: -Style.space(8)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: if (page.state) page.state.eqSourceRemove(srcRow.modelData.id)
+              }
+            }
+          }
+
+          Column {
+            anchors.left: srcSwitch.right
+            anchors.leftMargin: Style.space(10)
+            anchors.right: srcTrail.left
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 1
+
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              text: String(srcRow.modelData.name)
+              color: srcRow.modelData.enabled ? Color.foreground : Util.alpha(Color.foreground, 0.5)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+            }
+
+            Text {
+              width: parent.width
+              elide: Text.ElideRight
+              text: page.kindLabel(srcRow.modelData.kind) + " · " + srcRow.modelData.count
+                + " profiles · " + page.ago(srcRow.modelData.updated)
+              color: Util.alpha(Color.foreground, 0.45)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: parent.width
+              elide: Text.ElideMiddle
+              text: String(srcRow.modelData.target)
+              color: Util.alpha(Color.foreground, 0.35)
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+          }
+        }
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(26)
+
+        Chip {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          label: "Refresh all"
+          onPicked: if (page.state) page.state.eqSourceRefresh("")
+        }
+
+        Text {
+          anchors.right: parent.right
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          visible: page.state && page.state.eqSourcesBusy
+          text: "Working…"
+          color: Util.alpha(Color.foreground, 0.5)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      Gap { }
+
+      Head {
+        glyph: "󰐕"
+        title: "Add a source"
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(28)
+
+        Row {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(6)
+
+          Chip {
+            label: "GitHub repo"
+            selected: page.addKind === "github"
+            onPicked: page.addKind = "github"
+          }
+
+          Chip {
+            label: "List address"
+            selected: page.addKind === "json"
+            onPicked: page.addKind = "json"
+          }
+
+          Chip {
+            label: "Folder"
+            selected: page.addKind === "folder"
+            onPicked: page.addKind = "folder"
+          }
+        }
+      }
+
+      Field {
+        id: addTargetField
+        placeholder: page.addKind === "github" ? "owner/repo or owner/repo@branch"
+          : page.addKind === "json" ? "https://example.com/profiles.json"
+          : "/path/to/folder of ParametricEQ.txt files"
+        onAccepted: addButton.picked()
+      }
+
+      Field {
+        id: addNameField
+        placeholder: "Name (optional)"
+        onAccepted: addButton.picked()
+      }
+
+      Text {
+        width: parent.width
+        leftPadding: Style.space(10)
+        rightPadding: Style.space(10)
+        wrapMode: Text.WordWrap
+        text: page.addKind === "github"
+          ? "A repository laid out like AutoEq: results/INDEX.md and one folder per provider."
+          : page.addKind === "json"
+            ? "An address returning a list of {name, url} entries, with optional provider and category."
+            : "Every .txt file with Filter lines is a profile; sub-folders become categories."
+        color: Util.alpha(Color.foreground, 0.4)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
+      Item {
+        width: parent.width
+        height: Style.space(28)
+
+        Chip {
+          id: addButton
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          label: page.state && page.state.eqSourcesBusy && page.addPending ? "Checking…" : "Add source"
+          onPicked: {
+            if (!page.state || page.state.eqSourcesBusy) return
+            if (String(addTargetField.text).trim() === "") return
+            page.addPending = true
+            page.state.eqSourceAdd(page.addKind, String(addTargetField.text).trim(), String(addNameField.text).trim())
+          }
+        }
+      }
+
+      Text {
+        visible: page.state && page.state.eqSourcesError !== ""
+        width: parent.width
+        wrapMode: Text.WordWrap
+        leftPadding: Style.space(10)
+        rightPadding: Style.space(10)
+        text: page.state ? page.state.eqSourcesError : ""
+        color: Color.urgent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+    }
     }
   }
 }

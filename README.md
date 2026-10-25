@@ -42,10 +42,19 @@ The **Equalizer** row at the bottom of the audio page opens a view of its own
 - a profile drop-down;
 - a library of built-in presets (Flat, Bass Boost, Vocal, Treble) and any
   profile you import;
-- **Find online** (folded until opened): AutoEQ search by headphone model or by source (Crinacle,
-  oratory1990, Super Review, ...), or a pasted `ParametricEQ.txt` URL. The
-  source line in the panel names those sources; profiles are fetched from
-  `raw.githubusercontent.com/jaakkopasanen/AutoEq` and cached;
+- **Find online** (folded until opened): type a headphone model and the list
+  updates once you have stopped typing for a second. Results are **grouped by
+  provider** (crinacle, oratory1990, Rtings, Super Review and the rest of what
+  AutoEq publishes), three per group until you open one. A pasted
+  `ParametricEQ.txt` address imports on Enter.
+- **Sources**: Find online reads from a list you manage on its own page
+  (`Audio > Equalizer > Sources`). AutoEq is built in; you can switch any source
+  off, and add a **GitHub repo** laid out like AutoEq (`owner/repo[@branch]`), a
+  **list address** returning `[{name, url, provider?, category?}]`, or a
+  **folder** of `ParametricEQ.txt` files. A source is checked when it is added
+  and an unreadable one is refused. Indexes are cached for a week and
+  `Refresh all` rebuilds them. The list lives in
+  `~/.config/deck/eq/sources.json`;
 - a response curve, a preamp and a one-line summary per band that opens to
   editable **type** (peak, low shelf, high shelf), **frequency**, **gain** and
   **Q**, plus add/remove band; **Apply** (in the header, shown when there are
