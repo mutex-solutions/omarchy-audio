@@ -51,6 +51,31 @@ Item {
   property bool qualPickOpen: false
   property bool bitPickOpen: false
   property bool removeArmed: false
+  property bool newProfileOpen: false
+  property bool deleteArmed: false
+
+  Timer {
+    id: deleteDisarm
+    interval: 3500
+    onTriggered: page.deleteArmed = false
+  }
+
+  // The new profile starts from what is on screen, so "New" doubles as
+  // "save as". With nothing loaded it is a single flat band.
+  function createProfile(raw) {
+    var name = String(raw || "").trim()
+    if (!state || name === "") return
+    for (var i = 0; i < state.eqProfiles.length; i++)
+      if (String(state.eqProfiles[i].name).toLowerCase() === name.toLowerCase()) {
+        state.eqError = "A profile called " + name + " exists"
+        return
+      }
+    state.eqSaveProfile(name, eqPreampLocal, bandsArray())
+    newProfileOpen = false
+    pendingSelect = name
+  }
+
+  property string pendingSelect: ""
 
   Timer {
     id: removeDisarm
@@ -104,6 +129,7 @@ Item {
   property bool eqSearchOpen: false
   property string eqSearchText: ""
   property var expandedGroups: ({})
+  property bool providersOpen: false
   property string addKind: "github"
   property bool addPending: false
   property int bandRevision: 0
@@ -244,7 +270,7 @@ Item {
 
   Timer {
     id: searchDebounce
-    interval: 1000
+    interval: 400
     onTriggered: page.runSearch()
   }
 
@@ -259,12 +285,23 @@ Item {
 
   onViewChanged: {
     if (!state) return
-    if (view === "sources") state.eqLoadSources()
+    if (view === "sources") { state.eqLoadSources(); state.eqLoadProviders() }
     else if (view === "eq" && String(eqSearchText).trim() !== "") runSearch()
   }
 
   Connections {
     target: page.state
+    function onEqProfilesChanged() {
+      if (page.pendingSelect === "") return
+      for (var i = 0; i < page.state.eqProfiles.length; i++)
+        if (String(page.state.eqProfiles[i].name) === page.pendingSelect) {
+          var n = page.pendingSelect
+          page.pendingSelect = ""
+          page.state.eqApply(n, null, [])
+          return
+        }
+    }
+
     function onEqSourcesBusyChanged() {
       if (!page.state.eqSourcesBusy && page.addPending) {
         page.addPending = false
@@ -1254,18 +1291,6 @@ Item {
           }
         }
 
-        Text {
-          visible: page.state && page.state.reportLoaded && page.state.hardwareRates.length === 0
-          width: parent.width
-          wrapMode: Text.WordWrap
-          leftPadding: Style.space(10)
-          rightPadding: Style.space(10)
-          text: "This device does not list its rates. The ones below are what PipeWire may switch between; any the device cannot take is refused."
-          color: Util.alpha(Color.foreground, 0.4)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
-        }
-
         // ---- registry: what PipeWire has been told it may use ----
         Caps {
           visible: page.state && page.state.reportLoaded
@@ -1282,7 +1307,7 @@ Item {
           rightPadding: Style.space(10)
           text: page.state && page.state.liveAllowed.length > 0
             ? page.state.liveAllowed.map(function(r) { return Math.round(r / 100) / 10 }).join(", ") + " kHz"
-            : "None; PipeWire stays at its default rate"
+            : "None"
           color: Color.foreground
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -1298,11 +1323,10 @@ Item {
             if (!page.state) return ""
             if (page.state.capBusy) return "Working…"
             if (page.state.unregisteredRates.length > 0)
-              return page.state.unregisteredRates.length + " rates this device offers are not registered"
-            if (page.state.needsLive)
-              return "Written, not live yet. Make live restarts WirePlumber and audio pauses for a moment."
-            if (page.state.filesOurs) return "Registered by this panel"
-            return "Nothing registered by this panel"
+              return page.state.unregisteredRates.length + " not registered"
+            if (page.state.needsLive) return "Written, not live yet"
+            if (page.state.filesOurs) return "Registered"
+            return "Not registered"
           }
           color: Util.alpha(Color.foreground, 0.5)
           font.family: Style.font.family
@@ -1451,7 +1475,7 @@ Item {
           topPadding: Style.space(3)
           bottomPadding: Style.space(3)
           leftPadding: Style.space(8)
-          text: "Codec and bitrate controls appear with a Bluetooth output"
+          text: "Codec options appear with a Bluetooth output"
           color: Util.alpha(Color.foreground, 0.4)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -1594,6 +1618,70 @@ Item {
       }
 
 
+      Flow {
+        visible: page.state && page.state.eqLoaded
+        width: parent.width - Style.space(16)
+        x: Style.space(8)
+        spacing: Style.space(6)
+
+        Chip {
+          label: "New"
+          selected: page.newProfileOpen
+          onPicked: {
+            page.newProfileOpen = !page.newProfileOpen
+            newProfileField.text = ""
+          }
+        }
+
+        Chip {
+          visible: page.state && page.state.eqProfile !== ""
+          label: page.deleteArmed ? "Confirm delete" : "Delete"
+          onPicked: {
+            if (!page.state) return
+            if (page.deleteArmed) {
+              page.deleteArmed = false
+              page.state.eqDeleteProfile(page.state.eqProfile)
+            } else {
+              page.deleteArmed = true
+              deleteDisarm.restart()
+            }
+          }
+        }
+      }
+
+      Field {
+        id: newProfileField
+        visible: page.newProfileOpen
+        placeholder: "Name for the new profile"
+        onAccepted: page.createProfile(text)
+      }
+
+      Item {
+        visible: page.newProfileOpen
+        width: parent.width
+        height: Style.space(26)
+
+        Chip {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          label: "Save current as new"
+          onPicked: page.createProfile(newProfileField.text)
+        }
+      }
+
+      Text {
+        visible: page.state && page.state.eqError !== "" && !page.eqSearchOpen
+        width: parent.width
+        wrapMode: Text.Wrap
+        leftPadding: Style.space(8)
+        rightPadding: Style.space(8)
+        text: page.state ? page.state.eqError : ""
+        color: Color.urgent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption
+      }
+
       // ---- online profiles ----
       Fold {
         glyph: "󰖟"
@@ -1630,13 +1718,13 @@ Item {
           visible: text !== ""
           text: {
             var q = String(page.eqSearchText).trim()
-            if (page.isAddress(q)) return "Press Enter to import this address"
+            if (page.isAddress(q)) return "Enter to import"
             if (page.state && page.state.eqSearching) return "Searching…"
-            if (q === "") return "Searches as you type, grouped by who measured it"
+            if (q === "") return ""
             if (page.state && page.state.eqSearchResults.length === 0 && !searchDebounce.running)
               return "No profiles found"
             if (page.state && page.state.eqSearchResults.length > 0)
-              return page.state.eqSearchResults.length + " profiles from " + page.searchGroups.length + " providers"
+              return page.state.eqSearchResults.length + " results"
             return ""
           }
           color: Util.alpha(Color.foreground, 0.4)
@@ -2184,17 +2272,6 @@ Item {
         }
       }
 
-      Text {
-        width: parent.width
-        leftPadding: Style.space(8)
-        rightPadding: Style.space(8)
-        wrapMode: Text.WordWrap
-        text: "Where Find online looks. One source can hold many providers; the results are grouped by provider."
-        color: Util.alpha(Color.foreground, 0.5)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
-      }
-
       Gap { }
 
       Repeater {
@@ -2318,6 +2395,63 @@ Item {
 
       Gap { }
 
+      Fold {
+        glyph: "󰖟"
+        title: "Providers"
+        value: page.state && page.state.eqProviders.length > 0
+          ? page.state.eqProviders.filter(function(x) { return x.enabled }).length + " of " + page.state.eqProviders.length
+          : ""
+        open: page.providersOpen
+        onToggled: {
+          page.providersOpen = !page.providersOpen
+          if (page.providersOpen && page.state) page.state.eqLoadProviders()
+        }
+      }
+
+      Repeater {
+        model: page.providersOpen && page.state ? page.state.eqProviders : []
+
+        delegate: Item {
+          id: provRow
+          required property var modelData
+          width: col.width
+          height: Style.space(28)
+
+          Switch {
+            id: provSwitch
+            anchors.left: parent.left
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            checked: provRow.modelData.enabled === true
+            onToggled: if (page.state) page.state.eqProviderEnable(provRow.modelData.provider, !provRow.modelData.enabled)
+          }
+
+          Text {
+            anchors.left: provSwitch.right
+            anchors.leftMargin: Style.space(10)
+            anchors.right: provCount.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            elide: Text.ElideRight
+            text: String(provRow.modelData.provider)
+            color: provRow.modelData.enabled ? Color.foreground : Util.alpha(Color.foreground, 0.5)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          Text {
+            id: provCount
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            text: provRow.modelData.count
+            color: Util.alpha(Color.foreground, 0.45)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+
       Head {
         glyph: "󰐕"
         title: "Add a source"
@@ -2365,21 +2499,6 @@ Item {
         id: addNameField
         placeholder: "Name (optional)"
         onAccepted: addButton.picked()
-      }
-
-      Text {
-        width: parent.width
-        leftPadding: Style.space(10)
-        rightPadding: Style.space(10)
-        wrapMode: Text.WordWrap
-        text: page.addKind === "github"
-          ? "A repository laid out like AutoEq: results/INDEX.md and one folder per provider."
-          : page.addKind === "json"
-            ? "An address returning a list of {name, url} entries, with optional provider and category."
-            : "Every .txt file with Filter lines is a profile; sub-folders become categories."
-        color: Util.alpha(Color.foreground, 0.4)
-        font.family: Style.font.family
-        font.pixelSize: Style.font.caption
       }
 
       Item {

@@ -21,6 +21,17 @@
   **Make live** (restarts WirePlumber) and **Remove** (asks twice). Bluetooth
   gets drop-downs for codec now, preferred codec at connect, LDAC quality and
   AAC bitrate mode.
+- **Profiles can be created and deleted.** `New` saves what is on screen under
+  a name (so it doubles as save-as); `Delete` asks twice and refuses while the
+  profile is in use. The built-in presets are seeded once, so a deleted preset
+  stays deleted. `audio-eq` gained `save` and `delete`.
+- **Providers** (on the Sources page) lists every provider in the enabled
+  sources with its count and a switch, so a provider can be hidden from search
+  without removing its source.
+- Find online waits 0.4 s after typing, and the explanatory text on the
+  Equalizer, Sources and Rate & codec views is cut to labels.
+- After Remove, the rate list falls back to the usual rates so there is still
+  something to register.
 - Fixed the INDEX parser cutting names that contain a bracket, such as
   "(footsteps preset)".
 

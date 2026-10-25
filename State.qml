@@ -393,6 +393,43 @@ Item {
     s.eqStartSearch(q)
   }
 
+  property var eqProviders: []
+
+  Process {
+    id: eqProvidersProc
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { s.eqProviders = JSON.parse(String(text || "{}")).providers || [] } catch (e) {}
+      }
+    }
+  }
+
+  function eqLoadProviders() {
+    if (eqProvidersProc.running) return
+    eqProvidersProc.command = [s.eqHelper, "providers"]
+    eqProvidersProc.running = true
+  }
+
+  // Switching a provider is local and instant: the list is patched in place,
+  // the helper's file is the record.
+  function eqProviderEnable(name, on) {
+    var next = s.eqProviders.map(function(p) {
+      return p.provider === name ? Object.assign({}, p, { enabled: on }) : p
+    })
+    s.eqProviders = next
+    Quickshell.execDetached([s.eqHelper, "provider-enable", String(name), on ? "on" : "off"])
+  }
+
+  function eqSaveProfile(name, preamp, bands) {
+    s.eqRun(["save", String(name), "--preamp", String(preamp), "--bands-json", JSON.stringify(bands || [])])
+  }
+
+  function eqDeleteProfile(name) {
+    s.eqRun(["delete", String(name)])
+  }
+
   function eqSourcesRun(args) {
     if (eqSourcesProc.running) return
     s.eqSourcesBusy = true
@@ -487,7 +524,10 @@ Item {
   }
   // What the device says it can do; when it says nothing, the rates the clock
   // may switch between, which the helper will refuse if the device cannot take them.
-  readonly property var rateChoices: hardwareRates.length > 0 ? hardwareRates : liveAllowed
+  // Nothing registered and nothing reported (a fresh start, or after Remove)
+  // would leave the list empty and nothing to discover, so offer the usual ones.
+  readonly property var rateChoices: hardwareRates.length > 0 ? hardwareRates
+    : (liveAllowed.length > 0 ? liveAllowed : [44100, 48000, 88200, 96000, 176400, 192000])
 
   Process {
     id: capStatusProc

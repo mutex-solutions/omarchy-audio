@@ -8,6 +8,9 @@
 #   audio-eq on | off | toggle
 #   audio-eq import <url|path> [name]
 #   audio-eq search <query>
+#   audio-eq save <name> [--preamp dB] [--bands-json json]
+#   audio-eq delete <name>
+#   audio-eq providers | provider-enable <name> on|off
 #   audio-eq sources
 #   audio-eq source-add <github|json|folder> <target> [name]
 #   audio-eq source-remove <id> | source-enable <id> on|off | source-refresh [id]
@@ -55,6 +58,8 @@ need jq; need pactl; need systemctl; need awk; need curl
 mkdir -p "$PROFILE_DIR" "$STATE_DIR" "$FRAG_DIR" "$UNIT_DIR"
 
 init_builtins() {
+  # Seeded once, so a preset you delete stays deleted.
+  [[ -e $PROFILE_DIR/.seeded ]] && return 0
   local f="$PROFILE_DIR/Flat.txt"
   [[ -f $f ]] || cat > "$f" <<'P'
 Preamp: 0.0 dB
@@ -80,6 +85,7 @@ Preamp: -4.0 dB
 Filter 1: ON HS Fc 6000 Hz Gain 4.0 dB Q 0.70
 Filter 2: ON PK Fc 10000 Hz Gain 2.0 dB Q 0.90
 P
+  touch "$PROFILE_DIR/.seeded"
 }
 init_builtins
 
@@ -94,6 +100,23 @@ name_of() { basename "$1" .txt; }
 #           read from the path, not from the source.
 #   json    an address returning [{name, url, provider?, category?}]
 #   folder  a directory of ParametricEQ.txt files on this machine
+PROVIDERS_OFF="$CONFIG_HOME/deck/eq/providers-off.json"
+providers_off() {
+  if [[ -s $PROVIDERS_OFF ]] && jq -e 'type == "array"' "$PROVIDERS_OFF" >/dev/null 2>&1; then
+    cat "$PROVIDERS_OFF"
+  else
+    echo '[]'
+  fi
+}
+
+# Profile names become file names: no path separators, no control characters.
+clean_name() {
+  local n="$1"
+  n="$(tr -d '\000-\037' <<< "$n")"; n="${n//\//-}"
+  n="$(sed -E 's/^[ .]+//; s/[ ]+$//' <<< "$n")"
+  printf '%s' "${n:0:80}"
+}
+
 save_sources() { printf '%s\n' "$1" > "$SOURCES.tmp" && mv "$SOURCES.tmp" "$SOURCES"; }
 
 ensure_sources() {
@@ -572,15 +595,73 @@ case "${1:-status}" in
       [[ -s $INDEX_DIR/$id.json ]] && files+=("$INDEX_DIR/$id.json")
     done < <(jq -r '.[] | select(.enabled) | .id' "$SOURCES")
     [[ ${#files[@]} -gt 0 ]] || fail "no source could be read; check Manage sources"
-    jq -c -s --arg q "$(tr '[:upper:]' '[:lower:]' <<< "$q")" --argjson failed "$(printf '%s\n' "${failed[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" '
+    jq -c -s --arg q "$(tr '[:upper:]' '[:lower:]' <<< "$q")" --argjson off "$(providers_off)" --argjson failed "$(printf '%s\n' "${failed[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" '
       ($q | split(" ") | map(select(length > 0))) as $t
       | (add // []) as $all
       | { failed: $failed,
           results: [ $all[]
             | ((.name + " " + .provider + " " + .category + " " + .sourceName) | ascii_downcase) as $h
+            | select(.provider as $p | $off | index($p) | not)
             | select($t | all(. as $w | $h | contains($w)))
             | . + {rank: (if ((.name|ascii_downcase) | startswith($t[0])) then 0 else 1 end)} ]
           | sort_by(.rank, .name) | .[:400] | map(del(.rank)) }' "${files[@]}" ;;
+
+  save)
+    name="$(clean_name "${2:-}")"; [[ -n $name ]] || fail "usage: audio-eq save <name> [--preamp dB] [--bands-json json]"
+    shift 2
+    pre="0"; bands_json='[]'
+    while (($#)); do
+      case "$1" in
+        --preamp) pre="${2:?}"; shift 2 ;;
+        --bands-json) bands_json="${2:?}"; shift 2 ;;
+        *) fail "unknown option $1" ;;
+      esac
+    done
+    json="$(jq -nc --argjson p "$pre" --argjson b "$bands_json" '{preamp:$p, bands:$b}' 2>/dev/null)" \
+      || fail "those bands are not valid"
+    json="$(sanitize_profile "$json")" || fail "that profile has values the EQ cannot use"
+    [[ $(jq '.bands | length' <<< "$json") -gt 0 ]] \
+      || json="$(jq -c '.bands = [{type:"PK", fc:1000, gain:0, q:0.7}]' <<< "$json")"
+    jq -r '"Preamp: \(.preamp) dB",
+      (.bands | to_entries[] | "Filter \(.key + 1): ON \(.value.type) Fc \(.value.fc) Hz Gain \(.value.gain) dB Q \(.value.q)")' \
+      <<< "$json" > "$PROFILE_DIR/$name.txt"
+    jq -nc --arg name "$name" '{ok:true, saved:$name}' ;;
+
+  delete)
+    name="${2:-}"; [[ -n $name ]] || fail "usage: audio-eq delete <name>"
+    file="$PROFILE_DIR/$name.txt"
+    [[ -f $file && $(dirname "$file") == "$PROFILE_DIR" ]] || fail "no profile named $name"
+    if [[ "$(jq -r '.on // false' <<< "$(load_state)")" == true && "$(last_profile)" == "$name" ]]; then
+      fail "turn the equalizer off before deleting the profile it is using"
+    fi
+    rm -f "$file"
+    jq -nc --arg name "$name" '{ok:true, deleted:$name}' ;;
+
+  providers)
+    ensure_sources
+    mkdir -p "$INDEX_DIR"
+    while IFS= read -r id; do
+      [[ -s $INDEX_DIR/$id.json ]] || build_index "$id" >/dev/null 2>&1 || true
+    done < <(jq -r '.[] | select(.enabled) | .id' "$SOURCES")
+    files=()
+    while IFS= read -r id; do [[ -s $INDEX_DIR/$id.json ]] && files+=("$INDEX_DIR/$id.json"); done \
+      < <(jq -r '.[] | select(.enabled) | .id' "$SOURCES")
+    if [[ ${#files[@]} -eq 0 ]]; then echo '{"ok":true,"providers":[]}'; else
+      jq -c -s --argjson off "$(providers_off)" '
+        {ok:true, providers: (add | group_by(.provider)
+          | map({provider: .[0].provider, count: length, source: .[0].sourceName,
+                 enabled: ((.[0].provider as $p | $off | index($p)) == null)})
+          | sort_by(-.count))}' "${files[@]}"
+    fi ;;
+
+  provider-enable)
+    name="${2:-}"; val="${3:-}"
+    [[ -n $name && ( $val == on || $val == off ) ]] || fail "usage: audio-eq provider-enable <name> on|off"
+    mkdir -p "$(dirname "$PROVIDERS_OFF")"
+    jq -c --arg n "$name" --arg v "$val" '
+      (. - [$n]) + (if $v == "off" then [$n] else [] end)' <<< "$(providers_off)" > "$PROVIDERS_OFF.tmp" \
+      && mv "$PROVIDERS_OFF.tmp" "$PROVIDERS_OFF"
+    jq -nc '{ok:true}' ;;
 
   sources) ensure_sources; sources_json ;;
 
