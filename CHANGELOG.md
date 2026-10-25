@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1
+
+- **One back, from the host.** The Equalizer and Sources views no longer draw
+  their own breadcrumb. The page declares `trail`, `canGoBack`, `goBack()` and
+  `goTo(i)`, and Deck draws `Audio > Equalizer > Sources` in its header with
+  the usual back arrow; Esc and the `back` call step up one view too. The bar
+  popup got the same arrow and crumbs.
+
 ## 0.6.0
 
 - **Find online searches as you type.** The query runs one second after you

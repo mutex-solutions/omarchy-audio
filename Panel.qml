@@ -51,7 +51,11 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      onCloseRequested: {
+        var it = pageLoader.item
+        if (it && it.canGoBack === true) it.goBack()
+        else root.close()
+      }
       onActivateRequested: root.close()
     }
 
@@ -67,9 +71,39 @@ Panel {
         width: parent.width
         height: Style.space(24)
 
+        Rectangle {
+          id: backButton
+          visible: !!pageLoader.item && pageLoader.item.canGoBack === true
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          width: Style.space(24)
+          height: Style.space(24)
+          radius: Style.cornerRadius
+          color: backMouse.containsMouse ? Util.alpha(Color.foreground, Style.hoverFillAlpha) : "transparent"
+          border.width: 1
+          border.color: Util.alpha(Color.foreground, Style.normalBorderAlpha)
+
+          Text {
+            anchors.centerIn: parent
+            text: "←"
+            color: Color.foreground
+            font.family: Style.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          MouseArea {
+            id: backMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: pageLoader.item.goBack()
+          }
+        }
+
         Text {
           id: headerGlyph
-          anchors.left: parent.left
+          anchors.left: backButton.visible ? backButton.right : parent.left
+          anchors.leftMargin: backButton.visible ? Style.space(8) : 0
           anchors.verticalCenter: parent.verticalCenter
           text: "󰕾"
           color: Color.accent
@@ -81,7 +115,8 @@ Panel {
           anchors.left: headerGlyph.right
           anchors.leftMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
-          text: "Audio"
+          text: pageLoader.item && pageLoader.item.trail && pageLoader.item.trail.length > 0
+            ? "Audio  ›  " + pageLoader.item.trail.join("  ›  ") : "Audio"
           color: Color.foreground
           font.family: Style.font.family
           font.pixelSize: Style.font.title

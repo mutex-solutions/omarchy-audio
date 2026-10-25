@@ -18,6 +18,13 @@ Item {
   // Which view of the page is showing. The equalizer is large enough to be a
   // page of its own: reached from a row on the main view, with a way back.
   property string view: "main"
+
+  // The host draws the back button and the crumbs from these.
+  readonly property var trail: view === "eq" ? ["Equalizer"]
+    : view === "sources" ? ["Equalizer", "Sources"] : []
+  readonly property bool canGoBack: view !== "main"
+  function goBack() { view = view === "sources" ? "eq" : "main" }
+  function goTo(i) { view = i < 0 ? "main" : i === 0 ? "eq" : "sources" }
   property bool outPickOpen: false
   property bool inPickOpen: false
   property bool appsOpen: true
@@ -1523,47 +1530,14 @@ Item {
         width: parent.width
         height: Style.space(32)
 
-        // Breadcrumb: "Audio" goes back one level, "Equalizer" is where you are.
         Text {
-          id: eqBack
           anchors.left: parent.left
           anchors.leftMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
-          text: "Audio"
-          color: backMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.6)
+          text: page.state && page.state.eqOn ? "On" : "Off"
+          color: Util.alpha(Color.foreground, 0.6)
           font.family: Style.font.family
-          font.pixelSize: Style.font.title
-
-          MouseArea {
-            id: backMouse
-            anchors.fill: parent
-            anchors.margins: -Style.space(4)
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: page.view = "main"
-          }
-        }
-
-        Text {
-          id: eqCrumb
-          anchors.left: eqBack.right
-          anchors.leftMargin: Style.space(6)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "›"
-          color: Util.alpha(Color.foreground, 0.4)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.title
-        }
-
-        Text {
-          anchors.left: eqCrumb.right
-          anchors.leftMargin: Style.space(6)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Equalizer"
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.title
-          font.bold: true
+          font.pixelSize: Style.font.body
         }
 
         Switch {
@@ -2193,84 +2167,6 @@ Item {
       width: parent.width
       spacing: Style.space(2)
       visible: page.view === "sources"
-
-      Item {
-        width: parent.width
-        height: Style.space(32)
-
-        Text {
-          id: srcBack
-          anchors.left: parent.left
-          anchors.leftMargin: Style.space(8)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Audio"
-          color: srcBackMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.6)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.title
-
-          MouseArea {
-            id: srcBackMouse
-            anchors.fill: parent
-            anchors.margins: -Style.space(4)
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: page.view = "main"
-          }
-        }
-
-        Text {
-          id: srcCrumb1
-          anchors.left: srcBack.right
-          anchors.leftMargin: Style.space(6)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "›"
-          color: Util.alpha(Color.foreground, 0.4)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.title
-        }
-
-        Text {
-          id: srcEq
-          anchors.left: srcCrumb1.right
-          anchors.leftMargin: Style.space(6)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Equalizer"
-          color: srcEqMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.6)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.title
-
-          MouseArea {
-            id: srcEqMouse
-            anchors.fill: parent
-            anchors.margins: -Style.space(4)
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: page.view = "eq"
-          }
-        }
-
-        Text {
-          id: srcCrumb2
-          anchors.left: srcEq.right
-          anchors.leftMargin: Style.space(6)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "›"
-          color: Util.alpha(Color.foreground, 0.4)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.title
-        }
-
-        Text {
-          anchors.left: srcCrumb2.right
-          anchors.leftMargin: Style.space(6)
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Sources"
-          color: Color.foreground
-          font.family: Style.font.family
-          font.pixelSize: Style.font.title
-          font.bold: true
-        }
-      }
 
       Gap { }
 
