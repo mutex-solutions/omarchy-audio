@@ -207,6 +207,7 @@ Item {
   }
 
   // ------------------------------------------------------- headphone EQ
+  readonly property string capHelper: String(Qt.resolvedUrl("scripts/audio-capability")).replace("file://", "")
   readonly property string eqHelper: String(Qt.resolvedUrl("scripts/audio-eq")).replace("file://", "")
   property var eq: ({})
   property bool eqLoaded: false
@@ -474,7 +475,7 @@ Item {
 
   Process {
     id: capProc
-    command: ["audio-capability"]
+    command: [s.capHelper]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -492,7 +493,7 @@ Item {
   function refreshReport() {
     // With EQ on, the default sink is the filter sink, which has no hardware
     // capability. Probe the hardware the filter feeds instead.
-    var args = ["audio-capability"]
+    var args = [s.capHelper]
     if (s.eqOn && s.eqHardware !== "") args = args.concat(["--device", s.eqHardware])
     capProc.command = args
     if (!capProc.running) capProc.running = true
@@ -531,7 +532,7 @@ Item {
 
   Process {
     id: capStatusProc
-    command: ["audio-capability", "--status"]
+    command: [s.capHelper, "--status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -572,18 +573,18 @@ Item {
     capActProc.running = true
   }
 
-  function registerRates() { capAct(["audio-capability", "--apply"]) }
-  function makeLive() { capAct(["audio-capability", "--activate"]) }
-  function removeRegistration() { capAct(["audio-capability", "--revert"]) }
+  function registerRates() { capAct([s.capHelper, "--apply"]) }
+  function makeLive() { capAct([s.capHelper, "--activate"]) }
+  function removeRegistration() { capAct([s.capHelper, "--revert"]) }
 
   // A rate the clock is not yet allowed to reach has to be registered first;
   // the helper refuses to pin one that is not.
   function registerAndPin(rate) {
-    capAct(["bash", "-c", 'audio-capability --apply && audio-capability --rate "$1"', "_", String(rate)])
+    capAct(["bash", "-c", '"$1" --apply && "$1" --rate "$2"', "_", s.capHelper, String(rate)])
   }
 
   function runCap(args) {
-    Quickshell.execDetached(["audio-capability"].concat(args))
+    Quickshell.execDetached([s.capHelper].concat(args))
     capSettle.restart()
   }
 

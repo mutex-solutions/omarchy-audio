@@ -1258,7 +1258,7 @@ Item {
         spacing: Style.space(4)
         visible: page.advOpen
 
-        // The codec and clock come from the audio-capability helper. Without it,
+        // The codec and clock come from the bundled audio-capability helper. If it fails,
         // say so once rather than drawing controls that cannot act.
         Text {
           visible: page.state && !page.state.reportLoaded
@@ -1266,7 +1266,7 @@ Item {
           height: Style.space(24)
           verticalAlignment: Text.AlignVCenter
           leftPadding: Style.space(8)
-          text: "Install audio-capability for sample rate and codec controls"
+          text: "Sample rate and codec controls are unavailable"
           color: Util.alpha(Color.foreground, 0.4)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption

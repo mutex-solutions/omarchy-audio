@@ -93,10 +93,11 @@ that a Bluetooth output is needed.
 Output, input and per-app streams bind directly to Quickshell's Pipewire
 service, so a volume change from anywhere updates both modes immediately.
 
-The **Rate & codec** section reads the `audio-capability` helper's JSON report.
-That helper is the join between what the hardware advertises and what PipeWire
-is actually allowed to use, and it is the only way to show that gap honestly.
-Without it the section hides itself and says so; the rest of the panel works.
+The **Rate & codec** section reads the bundled `scripts/audio-capability`
+helper's JSON report. That helper is the join between what the hardware
+advertises and what PipeWire is actually allowed to use, and it is the only way
+to show that gap honestly. If it fails the section says so; the rest of the
+panel works. Its design notes and traps are in `docs/AUDIO-CAPABILITY.md`.
 The input meter is a real capture stream, so it runs only while the page is on
 screen, not while the widget sits in the bar.
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- **The helper ships with the plugin.** `scripts/audio-capability` moved in from
+  the sysadmin repo, so Rate & codec no longer needs anything on PATH. The
+  plugin calls it by its own path. Its notes are in `docs/AUDIO-CAPABILITY.md`.
+- Fixed a rate list written with commas being read as one bad number (four
+  `splits` patterns now accept `,` as well as spaces).
+- Replaces the old `dinhlongviolin1.audiocap` bar widget.
+
 ## 0.6.1
 
 - **One back, from the host.** The Equalizer and Sources views no longer draw

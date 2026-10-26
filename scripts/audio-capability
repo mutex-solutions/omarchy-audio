@@ -1,0 +1,1583 @@
+#!/bin/bash
+# audio-capability — report an audio output device's HARDWARE CAPABILITY next to
+# what PipeWire is actually using, as JSON.
+#
+# The default invocation is READ-ONLY: it never writes to the graph, the clock,
+# or any config. It only reads pactl / pw-dump / pw-metadata / amixer and the
+# ALSA proc tree. That is what makes it safe to run at any time, including while
+# audio plays.
+#
+# The point of the tool is the JOIN. Neither column is trustworthy alone:
+#   - capability comes from the hardware (`stream0`), and drivers misreport it
+#     (an SMSL PO100 advertises 32/768 while handling 24/192);
+#   - in-use comes from PipeWire, and it silently resamples to the graph clock
+#     (`clock.allowed-rates`), so a 384 kHz DAC can sit at 48 kHz forever.
+# Only shown side by side does the gap become visible.
+#
+# Usage:
+#   audio-capability                 # the current default sink
+#   audio-capability --device ibasso # first sink whose name matches (case-insensitive)
+#   audio-capability --pretty        # pretty-print the JSON
+#
+#   audio-capability --plan          # what --apply WOULD do. Writes nothing.
+#   audio-capability --status        # is it applied? Writes nothing.
+#   audio-capability --apply         # write the two config files, then go live
+#   audio-capability --activate      # restart the WirePlumber user service so
+#                                    # the per-device rules are picked up, then
+#                                    # report whether they actually landed
+#   audio-capability --revert        # remove them and restore the previous rates
+#   audio-capability --show global   # the generated global file and its contents
+#   audio-capability --show device   # the generated per-device file, same
+#
+#   audio-capability --rate auto     # stop pinning; the graph follows the stream
+#   audio-capability --rate 96000    # pin the graph clock to 96 kHz, right now
+#
+#   audio-capability --codec ldac       # switch a connected headset's codec NOW
+#   audio-capability --codec-pref codec=ldac    # prefer it from the next connect
+#   audio-capability --codec-pref quality=hq    # LDAC quality (auto/hq/sq/mq)
+#   audio-capability --codec-pref bitrate=3     # AAC bitrate mode (0-5)
+#   audio-capability --codec-pref none          # forget the preference
+#
+# --apply, --revert and --codec-pref are the modes that write, and between them
+# they only ever touch three files, all under $HOME, all stamped as generated and
+# all deletable.
+#
+# --rate is a manual override laid on top of the allowed set. It sets
+# `clock.force-rate`, which takes effect immediately with no restart, and `auto`
+# releases it. It is the only way to change the rate NOW: `clock.rate` is a
+# startup default, and otherwise the graph only picks a new rate when the devices
+# go idle. Pinning means everything that is not already at that rate is
+# converted — which is the point when you want one album bit-perfect.
+#
+# --codec and --codec-pref are two different things wearing one name, and
+# conflating them is the whole hazard:
+#   - `bluez5.codecs` (plural) is the PREFERRED list — an order, applied when the
+#     device connects. Only documented under `monitor.bluez.properties`, which is
+#     plugin-construction time. That is --codec-pref, and it is the reliable lever.
+#   - the LIVE switch on an open A2DP link is neither of those keys, and NOT
+#     `bluez5.codec` either: it is the SPA prop `bluetoothAudioCodec` on the
+#     bluez CARD, carrying an enum ordinal. The SPA plugin implements it
+#     (codec_switch_configure_a2dp and friends) and public docs describe none of
+#     it, so it was gated on evidence like the per-device ALSA rules are — and
+#     the evidence is in: see EMIT_BLUEZ_CODEC_SWITCH and codec_enum.
+# Neither is `wpctl set-profile`: the profiles this build exposes are per-ROLE
+# (a2dp-sink, bap-sink), never per-codec, so that lever cannot choose a codec.
+#
+# --activate runs `systemctl --user restart wireplumber`. That is a USER unit, so
+# it needs no privilege escalation — there is no sudo anywhere in this script.
+# It does interrupt playback for a moment, which is why it is a separate mode the
+# caller opts into rather than part of --apply.
+#
+# stdout is ALWAYS exactly one JSON object, in every mode. All human text goes
+# to stderr, so the panel can JSON.parse stdout unconditionally.
+#
+# Exit: 0 ok, 1 no matching sink, 2 usage, 3 refused (a target file exists that
+# this tool did not generate, --activate was asked for with nothing applied,
+# --rate was given a rate the device or the allowed set cannot reach, or --codec
+# was given a codec this build cannot offer or a sink that is not Bluetooth),
+# 4 the action failed or was partial, 5 the report could not be built at all —
+# stdout is then EMPTY, and an empty read is not "nothing changed": it is no
+# answer, which is why it does not get to share exit 0 with a real one.
+
+set -uo pipefail
+
+PRETTY=0
+MATCH=""
+MODE="read"
+SHOW_KEY=""
+RATE_ARG=""
+CODEC_ARG=""
+CODEC_PREF=""
+
+# Every option that takes a value reads "${2:-}" and then runs `shift 2`. With the
+# value MISSING that shift fails — $1 never advances, the case matches the same
+# word again, and the loop spins forever. `audio-capability --show` ran 2.5 million
+# iterations in six seconds and printed nothing; the only symptom of a mistyped or
+# truncated invocation is a hang. So the value is required explicitly, before the
+# shift can be reached. Sets ARG rather than echoing: a command substitution would
+# run `exit` in a subshell and never stop the loop it was called from.
+need_arg() {
+  if [[ -z ${2:-} ]]; then
+    echo "audio-capability: $1 needs a value" >&2
+    exit 2
+  fi
+  ARG="$2"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --device) need_arg --device "${2:-}"; MATCH="$ARG"; shift 2 ;;
+    --pretty) PRETTY=1; shift ;;
+    --plan|--dry-run) MODE="plan"; shift ;;
+    --status) MODE="status"; shift ;;
+    --apply) MODE="apply"; shift ;;
+    --activate|--restart) MODE="activate"; shift ;;
+    --revert) MODE="revert"; shift ;;
+    --show) need_arg --show "${2:-}"; MODE="show"; SHOW_KEY="$ARG"; shift 2 ;;
+    --rate) need_arg --rate "${2:-}"; MODE="rate"; RATE_ARG="$ARG"; shift 2 ;;
+    --codec) need_arg --codec "${2:-}"; MODE="codec"; CODEC_ARG="$ARG"; shift 2 ;;
+    --codec-pref) need_arg --codec-pref "${2:-}"; MODE="codepref"; CODEC_PREF="$ARG"; shift 2 ;;
+    -h|--help)
+      # The range is COMPUTED, not hand-maintained. It was hand-written twice and
+      # wrong twice, and it fails silently — the last lines simply stop appearing,
+      # so --help quietly under-reports the exit codes instead of erroring. Ask
+      # the file where its own header ends instead of asking a human to remember.
+      HELP_END="$(awk 'NR > 1 && /^#/ { n = NR; next } NR > 1 { print n; exit }' "$0")"
+      sed -n "2,${HELP_END}p" "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "audio-capability: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Absolute-ish path to this script, for the one mode that re-runs it: --activate
+# restarts WirePlumber and then needs a survey of the NEW graph, which it gets by
+# invoking itself with --status. BASH_SOURCE is the real path, so this works even
+# when the script was found through PATH.
+SELF="${BASH_SOURCE[0]:-$0}"
+
+emit() { # emit <json> [exit-code]
+  if [[ $PRETTY -eq 1 ]]; then printf '%s\n' "$1" | jq . 2>/dev/null || printf '%s\n' "$1"
+  else printf '%s\n' "$1"; fi
+  exit "${2:-0}"
+}
+
+# The three things this tool is allowed to own, plus the state it keeps about the
+# machine it found. All under $HOME; `50-`/`51-` not `90-` because Omarchy's own
+# audio tuning deletes stale `90-omarchy-speaker-tuning.conf` files from both dirs.
+#
+# BT_PREF_CONF is deliberately a separate file from WP_CONF rather than more keys
+# in it: WP_CONF is regenerated from the DETECTED device set on every --apply, so
+# a user choice stored there would be silently clobbered the next time a device
+# was plugged in. A preference is not a detection.
+STATE_DIR="$HOME/.local/state/audio-capability"
+LOG="$HOME/.local/state/omarchy/audio-capability.log"
+PW_CONF="$HOME/.config/pipewire/pipewire.conf.d/50-audio-capability.conf"
+WP_CONF="$HOME/.config/wireplumber/wireplumber.conf.d/50-audio-capability.conf"
+BT_PREF_CONF="$HOME/.config/wireplumber/wireplumber.conf.d/51-bluetooth-prefs.conf"
+STATE_RATES="$STATE_DIR/pre-apply-rates"
+
+# First line of both generated files. Doubles as the ownership marker: revert
+# refuses to delete a file that does not start with this, so a hand-written
+# config with the same name is never destroyed.
+GEN_MARK="# Generated by audio-capability"
+
+# State changes only, mirroring agent-mode's log. A successful read is not a
+# state change and is not worth a line; an apply or a revert is.
+log_line() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+# Per-device rules are gated on evidence, not on the syntax being documented.
+# `monitor.alsa.rules` -> `audio.allowed-rates` on a node is what the shipped
+# WirePlumber example implies, and the probe in AUDIO-CAPABILITY.md is what
+# proved it lands on this build. If a future WirePlumber stops honouring it,
+# flip this to 0 and the tool degrades to the global layer instead of writing a
+# rule that silently does nothing.
+EMIT_DEVICE_RULES=1
+EMIT_BLUEZ_RULE=1
+
+# The live A2DP codec switch is a SECOND gate. Unlike the ALSA rule it is
+# documented nowhere, so it was offered on evidence or not at all — and it is now
+# open, because the evidence arrived. Two things were wrong in the first
+# attempt, and both are worth knowing because each one ALONE is enough to make a
+# working mechanism look dead:
+#
+#   1. the key. `bluez5.codec` is not what the card exposes; `bluetoothAudioCodec`
+#      is, as a SPA enum ordinal (see codec_enum). The wrong key is accepted,
+#      echoed back by `pw-cli`, and silently ignored.
+#   2. the readback. A successful switch tears down the media node and creates a
+#      new one, so reading the node back by a remembered id returns nothing for a
+#      switch that in fact worked.
+#
+# Verified 2026-10-13 against a Sony WF-1000XM6: `LDAC -> AAC -> LDAC`, the
+# readback following each time and audio staying on the same sink. Flip to 0 and
+# `--codec` refuses with a distinct reason while `--codec-pref` keeps working.
+EMIT_BLUEZ_CODEC_SWITCH=1
+
+# The A2DP codec names THIS build accepts, derived from the build rather than from
+# memory or from a doc written against some other version:
+#
+#   strings /usr/lib/spa-0.2/bluez5/libspa-bluez5.so \
+#     | grep -oE '\b(sbc_xq|sbc|aac|ldac|aptx_hd|aptx_ll_duplex|aptx_ll|aptx|faststream_duplex|faststream|opus_05_pro|opus_05_duplex|opus_05|opus|lc3plus_h3|lc3)\b' | sort -u
+#
+# Notably ABSENT: aptx-adaptive. There is no libspa-codec-bluez5-aptx-adaptive.so
+# in this PipeWire, so the widget must not offer it — an offered codec that cannot
+# be loaded is exactly the kind of dead control this tool exists to avoid. Re-run
+# the command above after a PipeWire major bump.
+KNOWN_CODECS="sbc sbc_xq aac ldac aptx aptx_hd aptx_ll aptx_ll_duplex faststream faststream_duplex opus_05 opus_05_duplex opus_05_pro lc3"
+
+codec_known() { # is this a codec name this build can load?
+  local c="$1" k
+  for k in $KNOWN_CODECS; do [[ $c == "$k" ]] && return 0; done
+  return 1
+}
+
+# The live switch is NOT a `bluez5.codec` string write, which is what this tool
+# did first and what the docs imply. The bluez card exposes the codec as a SPA
+# param prop — `pw-cli enum-params <card> Props` prints
+#
+#   Prop: key Spa:Pod:Object:Param:Props:bluetoothAudioCodec (270)
+#     Id 8        (Spa:Enum:BluetoothAudioCodec:ldac)
+#
+# — an ordinal from the enum in `spa/param/bluetooth/audio.h`, NOT the name and
+# NOT the `bluez5.*` namespace the other codec keys live in. Writing
+# `{"bluez5.codec": "aac"}` is accepted, echoed back, and does nothing at all,
+# which is exactly why the first implementation read "no change" forever.
+#
+# The ordinals are the header's own order, with START = 0. LDAC = 8 is confirmed
+# against this card, which reports `ldac` as Id 8 rather than being assumed.
+codec_enum() { # codec name -> SPA BluetoothAudioCodec ordinal
+  case "$1" in
+    sbc)               echo 1  ;;
+    sbc_xq)            echo 2  ;;
+    mpeg)              echo 3  ;;
+    aac)               echo 4  ;;
+    aac_eld)           echo 5  ;;
+    aptx)              echo 6  ;;
+    aptx_hd)           echo 7  ;;
+    ldac)              echo 8  ;;
+    aptx_ll)           echo 9  ;;
+    aptx_ll_duplex)    echo 10 ;;
+    faststream)        echo 11 ;;
+    faststream_duplex) echo 12 ;;
+    lc3plus_hr)        echo 13 ;;
+    opus_05)           echo 14 ;;
+    opus_05_51)        echo 15 ;;
+    opus_05_71)        echo 16 ;;
+    opus_05_duplex)    echo 17 ;;
+    opus_05_pro)       echo 18 ;;
+    opus_g)            echo 19 ;;
+    *)                 echo "" ;;
+  esac
+}
+
+# Which of the two generated files is on disk, and whether we own it. Defined here
+# rather than inside the survey because `--show` needs it and `--show` does not
+# need a sink: it must keep working during the window where WirePlumber is
+# restarting and the sinks have briefly gone away.
+file_state() {
+  [[ -e $1 ]] || { echo absent; return; }
+  head -1 "$1" 2>/dev/null | grep -qF "$GEN_MARK" && echo ours || echo foreign
+}
+
+# --------------------------------------------------------------- rule helpers
+
+# Escape a PipeWire node name into the body of a POSIX ERE. Only `.` is handled
+# specially, and it becomes a character class rather than `\.`: a backslash
+# inside a SPA-JSON string inside a .conf file has to survive two escaping
+# layers, and getting the count wrong yields a rule that silently matches
+# nothing. `[.]` means the same thing with no backslash at all.
+esc_name() { printf '%s' "$1" | sed 's/\./[.]/g'; }
+
+# Node names are built from a constrained charset. Anything outside it would
+# need real escaping, so refuse the rule rather than emit a wrong one. Written
+# as a case allowlist rather than a bracket expression inside [[ ]] — the
+# escaped `[`/`|` in that form is parsed by bash as syntax, not as a pattern.
+name_is_regex_safe() {
+  case "$1" in
+    *[!A-Za-z0-9_.:-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# A USB node name ends in "-<card-index>.<profile>", and *both* parts move: the
+# card index changes with port and boot order, the profile changes when the
+# user picks a different one. The vendor/product/serial prefix survives all of
+# that, so that is what the rule anchors on. Non-USB names have no such tail
+# and are matched whole.
+match_regex_for() {
+  local n="$1" base
+  if [[ $n == alsa_output.usb-* ]]; then
+    base="$(printf '%s' "$n" | sed -E 's/-[0-9]+\.[^.]*$//')"
+    printf '^%s' "$(esc_name "$base")"
+  else
+    printf '^%s$' "$(esc_name "$n")"
+  fi
+}
+
+rates_list() { # JSON array -> "[ 44100 48000 ]"
+  printf '%s' "$1" | jq -r 'if length == 0 then "[]"
+                           else "[ " + (map(tostring) | join(" ")) + " ]" end'
+}
+
+# ------------------------------------------------------------ capability read
+
+# One record per playback altset of an ALSA stream0 file, as TSV:
+# format, bits, rates, dsd-line-or-"-". Fields land in the order Format, Rates,
+# Bits, so emit on the next altset boundary.
+altset_rows() {
+  awk '
+    /^Playback:/ { play = 1; next }
+    /^Capture:/  { play = 0; next }
+    play && /Altset/ {
+      if (fmt != "") printf "%s\t%s\t%s\t%s\n", fmt, bits, rates, (dsd == "" ? "-" : dsd)
+      fmt = ""; bits = ""; rates = ""; dsd = ""
+      next
+    }
+    play && /Format:/   { fmt = $2 }
+    play && /^[ \t]*Bits:/  { bits = $2 }
+    play && /^[ \t]*Rates:/ { rates = $0; sub(/^[ \t]*Rates:[ \t]*/, "", rates) }
+    play && /DSD raw:/  { dsd = $0; sub(/^[ \t]*/, "", dsd) }
+    END { if (fmt != "") printf "%s\t%s\t%s\t%s\n", fmt, bits, rates, (dsd == "" ? "-" : dsd) }
+  ' "$1"
+}
+
+# ----------------------------------------------------------------------- show
+
+# The generated files, so the panel can unfold what was actually written without
+# leaving the bar: the file IS the change, so showing it is showing what
+# happened. Read-only, and it reads the file on disk rather than regenerating it,
+# so what is displayed is exactly what a daemon will parse.
+#
+# Handled BEFORE the sink survey on purpose. It needs no sink, and it has to keep
+# working during the one window where sinks genuinely disappear — while
+# WirePlumber is restarting after --activate.
+if [[ $MODE == show ]]; then
+  case "$SHOW_KEY" in
+    global) SHOW_PATH="$PW_CONF" ;;
+    device) SHOW_PATH="$WP_CONF" ;;
+    "") echo "audio-capability: --show needs a target: global or device" >&2
+        emit '{"action":"show","ok":false,"error":"missing target"}' 2 ;;
+    *)  echo "audio-capability: --show target must be 'global' or 'device', not '$SHOW_KEY'" >&2
+        emit '{"action":"show","ok":false,"error":"bad target"}' 2 ;;
+  esac
+  SHOW_STATE="$(file_state "$SHOW_PATH")"
+  if [[ $SHOW_STATE == absent ]]; then
+    emit "$(jq -cn --arg k "$SHOW_KEY" --arg p "$SHOW_PATH" --arg s "$SHOW_STATE" \
+      '{action: "show", ok: true,
+        file: {key: $k, path: $p, state: $s, exists: false, lines: 0, content: null}}')"
+  fi
+  SHOW_LINES="$(wc -l < "$SHOW_PATH" 2>/dev/null | tr -d ' ')"
+  emit "$(jq -cn --arg k "$SHOW_KEY" --arg p "$SHOW_PATH" --arg s "$SHOW_STATE" \
+    --argjson n "${SHOW_LINES:-0}" --rawfile c "$SHOW_PATH" \
+    '{action: "show", ok: true,
+      file: {key: $k, path: $p, state: $s, exists: true, lines: $n, content: $c}}')"
+fi
+
+if [[ $MODE != read ]]; then
+  # -------------------------------------------------------- all-sink survey
+  # Every mode below needs the same three facts per sink, so they are gathered
+  # once here. `pactl list sinks` and `pw-dump` each serialise a lot; calling
+  # them inside the per-sink loop would cost N times as much.
+
+  SINKS_FULL="$(pactl list sinks 2>/dev/null)"
+  PWDUMP="$(pw-dump 2>/dev/null)"
+  mapfile -t SINK_NAMES < <(pactl list sinks short 2>/dev/null | awk '{print $2}')
+
+  if (( ${#SINK_NAMES[@]} == 0 )); then
+    echo "audio-capability: no output sinks found" >&2
+    emit '{"action":"'"$MODE"'","ok":false,"error":"no output sinks found"}' 1
+  fi
+
+  sink_card_of() {
+    printf '%s\n' "$SINKS_FULL" | awk -v s="$1" '
+      $0 ~ "^[ \t]*Name: " s "$" { inside = 1; next }
+      inside && /^Sink #/ { exit }
+      inside && /alsa[.]card = / { v = $0; sub(".*alsa[.]card = \"", "", v); sub("\".*", "", v); print v; exit }
+    '
+  }
+
+  sink_node_of() {
+    printf '%s' "$PWDUMP" | jq -r --arg s "$1" \
+      '.[] | select(.info.props["node.name"] == $s) | .id' 2>/dev/null | head -1
+  }
+
+  # What the NODE currently carries in `audio.allowed-rates` — the property the
+  # per-device rule is supposed to set. This is the difference between "the rule
+  # is written" and "the rule landed": WirePlumber evaluates monitor.*.rules when
+  # it CREATES a node, so until the node is re-created this is empty and the rule
+  # is pending. Absent and `[]` are both reported as `[]`; an empty array means
+  # "any rate", which is exactly the unpinned state.
+  #
+  # Property values arrive as SPA arrays, but a value round-tripped through the
+  # daemon can surface as a string like "[ 44100 48000 ]", so both are handled.
+  sink_node_rates_of() {
+    local node
+    node="$(sink_node_of "$1")"
+    [[ -n $node ]] || { echo '[]'; return; }
+    printf '%s' "$PWDUMP" | jq -c --argjson n "$node" '
+      .[] | select(.id == $n) | .info.props["audio.allowed-rates"] // []
+      | if type == "array" then map(tonumber? // empty)
+        elif type == "string" then
+          (gsub("\\[|\\]"; "") | split(" ") | map(tonumber? // empty))
+        else [] end
+      | map(select(. >= 8000 and . <= 768000)) | unique | sort' 2>/dev/null || echo '[]'
+  }
+
+  # The same two sources the read path uses, in the same order: a USB device's
+  # own stream0 is authoritative, and PipeWire's EnumFormat is the best
+  # available statement for everything else. Empty means "not known" — never
+  # treat it as "no rates allowed".
+  sink_rates_of() {
+    local s="$1" card node
+    card="$(sink_card_of "$s")"
+    node="$(sink_node_of "$s")"
+    if [[ -n $card && -r /proc/asound/card${card}/stream0 ]]; then
+      # -R -s, so the whole TSV arrives as one string and split("\n") sees the
+      # rows. Without them jq tries to parse each line as JSON and dies.
+      altset_rows "/proc/asound/card${card}/stream0" | jq -R -s -c '
+        split("\n") | map(select(length > 0) | split("\t")[2]
+          | split(",") | map(gsub("^ +| +$"; "") | tonumber?) | .[])
+        | map(select(. != null)) | unique | sort' 2>/dev/null
+      return
+    fi
+    if [[ -n $node ]]; then
+      printf '%s' "$PWDUMP" | jq -c --argjson n "$node" '
+        .[] | select(.id == $n) | .info.params.EnumFormat[0] // null
+        | if . == null then []
+          else (.rate | if type == "object" then [.min, .max] | map(select(. != null)) else [.] end)
+          end' 2>/dev/null
+      return
+    fi
+    echo '[]'
+  }
+
+  # ------------------------------------------------------------- build a plan
+
+  PLAN_SINKS=(); PLAN_MATCH=(); PLAN_RATES=(); PLAN_LABELS=(); PLAN_NODERATES=()
+  UNION_RATES=()
+  SURVEY_NOTES='[]'
+  add_note() { SURVEY_NOTES="$(printf '%s' "$SURVEY_NOTES" | jq -c --arg n "$1" '. + [$n]')"; }
+
+  for s in "${SINK_NAMES[@]}"; do
+    [[ -n $s ]] || continue
+    r="$(sink_rates_of "$s")"
+    # Guard the parse: anything that is not a sane audio rate is dropped rather
+    # than written into a config that would then refuse to load.
+    r="$(printf '%s' "$r" | jq -c '[.[] | select(type == "number" and . >= 8000 and . <= 768000)] | unique | sort' 2>/dev/null)"
+    [[ -n $r ]] || r='[]'
+    label="$(printf '%s\n' "$SINKS_FULL" | awk -v s="$s" '
+      $0 ~ "^[ \t]*Name: " s "$" { inside = 1; next }
+      inside && /^Sink #/ { exit }
+      inside && /device[.]description = / { v = $0; sub(".*device[.]description = \"", "", v); sub("\".*", "", v); print v; exit }
+      inside && /Description: / { v = $0; sub(".*Description: ", "", v); print v; exit }
+    '
+    )"
+    [[ -n $label ]] || label="$s"
+
+    # A device whose capability could not be read gets no rule at all. Writing
+    # `audio.allowed-rates = []` would not mean "no rates", it would mean "any
+    # rate" — the same as its current default — so the write would be noise at
+    # best; and writing a guessed single rate would be worse than leaving it.
+    if [[ "$(printf '%s' "$r" | jq 'length')" == 0 ]]; then
+      add_note "${label}: no rate list reported; left at its current setting"
+      continue
+    fi
+
+    # Every readable device's ladder feeds the graph clock, Bluetooth included —
+    # for A2DP to stop being resampled, the clock has to be allowed to run at an
+    # A2DP rate too.
+    UNION_RATES+=("$r")
+
+    # But a Bluetooth node is not an ALSA node, and `monitor.alsa.rules` cannot
+    # match one: the ALSA monitor does not create those nodes. An entry for it
+    # would be a rule that matches nothing — and it would also count forever as a
+    # device whose rule has "not landed", because the property it would set is
+    # the one the bluez rule sets instead. It is covered by monitor.bluez.rules
+    # below, so it gets no per-device ALSA rule.
+    [[ $s == bluez_output.* ]] && continue
+
+    if ! name_is_regex_safe "$s"; then
+      add_note "${label}: device name needs escaping; left at its current setting"
+      continue
+    fi
+    PLAN_SINKS+=("$s"); PLAN_LABELS+=("$label")
+    PLAN_MATCH+=("$(match_regex_for "$s")"); PLAN_RATES+=("$r")
+    PLAN_NODERATES+=("$(sink_node_rates_of "$s")")
+  done
+
+  # The union the graph clock may switch between. Every connected device's
+  # ladder plus, defensively, the rate the graph is already running at — the
+  # clock must never be denied the value it currently holds.
+  CLOCK_RATE_NOW="$(pw-metadata -n settings 2>/dev/null \
+    | sed -n "s/.*key:'clock.rate' value:'\([^']*\)'.*/\1/p" | head -1)"
+  if (( ${#UNION_RATES[@]} > 0 )); then
+    UNION="$(printf '%s\n' "${UNION_RATES[@]}" | jq -sc 'add | unique | sort')"
+  else
+    UNION='[]'
+  fi
+  if [[ -n ${CLOCK_RATE_NOW:-} && $CLOCK_RATE_NOW =~ ^[0-9]+$ ]]; then
+    UNION="$(printf '%s' "$UNION" | jq -c --argjson r "$CLOCK_RATE_NOW" '. + [$r] | unique | sort')"
+  fi
+
+  # `man pipewire.conf`: "up to 32 alternative sample rates".
+  if [[ "$(printf '%s' "$UNION" | jq 'length')" -gt 32 ]]; then
+    echo "audio-capability: union of device rates exceeds PipeWire's 32-rate limit" >&2
+    emit '{"action":"'"$MODE"'","ok":false,"error":"too many rates"}' 3
+  fi
+
+  PLAN_DEVICES="$(jq -cn \
+    --argjson sinks "$(printf '%s\n' "${PLAN_SINKS[@]:-}" | jq -R -s 'split("\n") | map(select(length > 0))')" \
+    --argjson labels "$(printf '%s\n' "${PLAN_LABELS[@]:-}" | jq -R -s 'split("\n") | map(select(length > 0))')" \
+    --argjson rates "$(printf '%s\n' "${PLAN_RATES[@]:-}" | jq -R -s 'split("\n") | map(select(length > 0) | fromjson)')" \
+    --argjson match "$(printf '%s\n' "${PLAN_MATCH[@]:-}" | jq -R -s 'split("\n") | map(select(length > 0))')" \
+    --argjson noderates "$(printf '%s\n' "${PLAN_NODERATES[@]:-}" | jq -R -s 'split("\n") | map(select(length > 0) | fromjson?) | map(if . == null then [] else . end)')" \
+    '[range(0; ($sinks | length)) | {sink: $sinks[.], label: $labels[.],
+                                     rates: $rates[.], match: $match[.],
+                                     nodeRates: ($noderates[.] // [])}]')"
+
+  PW_STATE="$(file_state "$PW_CONF")"
+  WP_STATE="$(file_state "$WP_CONF")"
+  LIVE_RATES="$(pw-metadata -n settings 2>/dev/null \
+    | sed -n "s/.*key:'clock.allowed-rates' value:'\[\([^]]*\)\]'.*/\1/p" | head -1 \
+    | jq -R -c '[splits("[ ,\t]+") | select(length > 0) | tonumber]' 2>/dev/null || echo '[]')"
+
+  RECORDED='[]'
+  [[ -r $STATE_RATES ]] && RECORDED="$(jq -R -c '[splits("[ ,\t]+") | select(length > 0) | tonumber]' < "$STATE_RATES" 2>/dev/null)"
+  [[ -n $RECORDED ]] || RECORDED='[]'
+
+  DRIFT='[]'
+  if [[ $PW_STATE == ours || $WP_STATE == ours ]] \
+     && [[ "$(printf '%s' "$LIVE_RATES" | jq -sc 'sort')" != "$(printf '%s' "$UNION" | jq -sc 'sort')" ]]; then
+    DRIFT='["the generated config and the live clock rate list disagree"]'
+  fi
+
+  # "Applied" means both halves agree: the files are ours AND the running graph
+  # is on the rate list they describe. Either one alone is a half-applied state,
+  # and reports as such.
+  APPLIED=false
+  if [[ $PW_STATE == ours || $WP_STATE == ours ]] \
+     && [[ "$(printf '%s' "$LIVE_RATES" | jq -sc 'sort')" == "$(printf '%s' "$UNION" | jq -sc 'sort')" ]]; then
+    APPLIED=true
+  fi
+
+  # Layer 2 is a THIRD state, and it is the one the user cannot see any other way.
+  # A rule is written by --apply but only takes effect when WirePlumber next
+  # creates the node, so between the two the config is right and the device is
+  # not. `rulesExpected` says a per-device rule was emitted at all (false if the
+  # feature was compiled out); `rulesLanded` says every one of those nodes now
+  # really carries the ladder the rule asked for. Comparing the actual ladders
+  # rather than merely checking for a non-empty property is deliberate: a node
+  # holding a stale or partial list has not picked the rule up either.
+  RULES_EXPECTED=false
+  RULES_LANDED=false
+  if [[ $EMIT_DEVICE_RULES -eq 1 ]] && (( ${#PLAN_SINKS[@]} > 0 )); then
+    RULES_EXPECTED=true
+    if [[ "$(printf '%s' "$PLAN_DEVICES" | jq -c \
+        'all(.nodeRates as $n | .rates as $r
+             | (($n | sort) == ($r | sort)) and ($r | length > 0))')" == true ]]; then
+      RULES_LANDED=true
+    fi
+  fi
+
+  SURVEY="$(jq -cn \
+    --argjson devices "$PLAN_DEVICES" \
+    --argjson union "$UNION" \
+    --argjson notes "$SURVEY_NOTES" \
+    --argjson live "$LIVE_RATES" \
+    --argjson recorded "$RECORDED" \
+    --argjson drift "$DRIFT" \
+    --arg pwState "$PW_STATE" \
+    --arg wpState "$WP_STATE" \
+    --arg pwConf "$PW_CONF" \
+    --arg wpConf "$WP_CONF" \
+    --argjson deviceRules "$EMIT_DEVICE_RULES" \
+    --argjson bluezRule "$EMIT_BLUEZ_RULE" \
+    --argjson rulesExpected "$RULES_EXPECTED" \
+    --argjson rulesLanded "$RULES_LANDED" \
+    '{
+      devices: $devices,
+      union: $union,
+      notes: $notes,
+      liveAllowedRates: $live,
+      recordedRates: $recorded,
+      drift: $drift,
+      deviceRules: ($deviceRules == 1),
+      bluezRule: ($bluezRule == 1),
+      rulesExpected: $rulesExpected,
+      rulesLanded: $rulesLanded,
+      files: {
+        global: { path: $pwConf, state: $pwState },
+        device: { path: $wpConf, state: $wpState }
+      }
+    }')"
+
+  # ------------------------------------------------------------------- status
+
+  if [[ $MODE == status ]]; then
+    emit "$(printf '%s' "$SURVEY" | jq -c --argjson a "$APPLIED" '. + {action: "status", applied: $a, ok: true}')"
+  fi
+
+  # --------------------------------------------------------------------- plan
+
+  if [[ $MODE == plan ]]; then
+    emit "$(printf '%s' "$SURVEY" | jq -c --argjson a "$APPLIED" \
+      '. + {action: "plan", ok: true, applied: $a,
+             wouldChange: (.union != .liveAllowedRates),
+             refuses: ([.files.global.state, .files.device.state] | any(. == "foreign"))}')"
+  fi
+
+  # ----------------------------------------------------------------- activate
+
+  # Layer 2 only lands when WirePlumber creates the node, and there is no reload
+  # to ask for — `systemctl --user show wireplumber -p CanReload` is `no`. So it
+  # is a restart, and the restart is its OWN mode rather than part of --apply:
+  # it interrupts playback for a moment, and that is the user's call to make, not
+  # something the tool decides because a config file changed.
+  #
+  # wireplumber.service is a USER unit (`/usr/lib/systemd/user/`), so this needs
+  # no privilege escalation and no polkit prompt. There is no sudo here.
+  if [[ $MODE == activate ]]; then
+    if [[ $PW_STATE != ours && $WP_STATE != ours ]]; then
+      echo "audio-capability: nothing is applied, so there is nothing to activate" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "activate", ok: false, restarted: false}')" 3
+    fi
+    if ! have systemctl; then
+      echo "audio-capability: systemctl not found — restart wireplumber by hand" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "activate", ok: false, restarted: false}')" 4
+    fi
+
+    if ! timeout 20 systemctl --user restart wireplumber >/dev/null 2>&1; then
+      log_line "activate restarted=false"
+      echo "audio-capability: could not restart wireplumber" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "activate", ok: false, restarted: false}')" 4
+    fi
+
+    # Everything gathered above describes the graph BEFORE the restart, so it is
+    # not evidence about anything that happens next. Re-survey from scratch, and
+    # poll first — the nodes come back asynchronously, and a survey taken too
+    # early reports "did not land" for a rule that simply had not been evaluated
+    # yet, which is the exact false negative this mode exists to avoid.
+    #
+    # The poll is deliberately cheap: one `pw-dump` filtered to the properties
+    # being waited for (~30ms), not a full survey (~600ms). Polling with the full
+    # survey made this mode take half a minute, which is absurd for something a
+    # button triggers. The expensive survey runs ONCE, when there is a result.
+    AFTER=""
+    if $RULES_EXPECTED; then
+      WAIT_NAMES="$(printf '%s\n' "${PLAN_SINKS[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')"
+      for ((i = 0; i < 12; i++)); do
+        # True only when EVERY expected node exists AND carries a non-empty rate
+        # list. Requiring all of them (rather than any) is what stops this from
+        # breaking early on the first node and then reporting a false "not
+        # landed" for the slow ones.
+        if pw-dump 2>/dev/null | jq -e --argjson names "$WAIT_NAMES" '
+             [ .[] | select(.type == "PipeWire:Interface:Node") | .info.props
+               | select((."node.name" // "") as $n | $names | index($n))
+               | (."audio.allowed-rates" // [])
+               | if type == "array" then length else (tostring | length) end ]
+             | length == ($names | length) and all(. > 0)' >/dev/null 2>&1; then
+          break
+        fi
+        sleep 0.4
+      done
+    fi
+    AFTER="$("$SELF" --status 2>/dev/null)"
+    [[ -n $AFTER ]] || AFTER="$SURVEY"
+
+    LANDED="$(printf '%s' "$AFTER" | jq -r '.rulesLanded // false')"
+    log_line "activate restarted=true landed=$LANDED"
+    emit "$(printf '%s' "$AFTER" | jq -c \
+      '. + {action: "activate", ok: true, restarted: true}')"
+  fi
+
+  # ------------------------------------------------------- generate + write
+
+  gen_global_conf() {
+    local n_var=0 n_fixed=0 r
+    for r in "${UNION_RATES[@]}"; do
+      if [[ "$(printf '%s' "$r" | jq 'length')" -gt 1 ]]; then n_var=$((n_var + 1)); else n_fixed=$((n_fixed + 1)); fi
+    done
+    cat <<EOF
+$GEN_MARK — do not edit.
+# Revert:  audio-capability --revert
+# Applied: $(date -Is)
+#
+# Union of ${#UNION_RATES[@]} output device(s) (${n_var} variable-rate, ${n_fixed} fixed-rate).
+# PipeWire only ever runs its graph at one of these rates, and switches between
+# them only while the devices are idle. Without this list the graph is pinned to
+# the single rate below and every other rate is resampled.
+#
+# Restores to: $(rates_list "$1")
+context.properties = {
+  default.clock.allowed-rates = $(rates_list "$UNION")
+}
+EOF
+  }
+
+  gen_device_conf() {
+    cat <<EOF
+$GEN_MARK — do not edit.
+# Revert:  audio-capability --revert
+# Applied: $(date -Is)
+#
+# One rule per output node, pinning it to the rates it actually advertises, so
+# widening the graph clock above cannot push a fixed-rate device (the internal
+# HDA sinks and Bluetooth are both fixed at 48 kHz) somewhere it cannot go.
+#
+# WirePlumber evaluates these when it creates a node, so they take effect on the
+# next device replug, or now with:
+#   systemctl --user restart wireplumber
+EOF
+    if [[ $EMIT_DEVICE_RULES -eq 1 ]]; then
+      printf '\nmonitor.alsa.rules = [\n'
+      local i
+      for i in "${!PLAN_SINKS[@]}"; do
+        printf '  {\n'
+        printf '    matches = [ { node.name = "~%s" } ]\n' "${PLAN_MATCH[$i]}"
+        printf '    actions = { update-props = { audio.allowed-rates = %s } }\n' "$(rates_list "${PLAN_RATES[$i]}")"
+        printf '  }\n'
+      done
+      printf ']\n'
+    else
+      printf '\n# Per-device rules are disabled on this build (see EMIT_DEVICE_RULES).\n'
+    fi
+    if [[ $EMIT_BLUEZ_RULE -eq 1 ]]; then
+      cat <<'EOF'
+
+# A2DP is NOT fixed at 48000: SBC and AAC are 44100/48000, but LDAC runs
+# 44.1/48/88.2/96. Pinned to the conservative pair so a widened graph clock
+# cannot drag a Bluetooth sink off a rate its codec is using.
+#
+# UNVERIFIED with an LDAC headset: whether this pin CAPS LDAC at 48 kHz or only
+# fails to widen it. Widen to include 88200/96000 only on evidence — the same
+# rule this tool applies to every other rule key it has not seen work.
+monitor.bluez.rules = [
+  {
+    matches = [ { node.name = "~^bluez_output[.]" } ]
+    actions = { update-props = { audio.allowed-rates = [ 44100 48000 ] } }
+  }
+]
+EOF
+    fi
+  }
+
+  # -------------------------------------------------------------------- apply
+
+  if [[ $MODE == apply ]]; then
+    if [[ "$(printf '%s' "$UNION" | jq 'length')" == 0 ]]; then
+      echo "audio-capability: no connected device reported a usable rate list — nothing written" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "apply", ok: false, changed: false}')" 4
+    fi
+    if [[ $PW_STATE == foreign ]]; then
+      echo "audio-capability: $PW_CONF exists and was not generated by this tool — refusing to overwrite it" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "apply", ok: false, changed: false}')" 3
+    fi
+    if [[ $WP_STATE == foreign ]]; then
+      echo "audio-capability: $WP_CONF exists and was not generated by this tool — refusing to overwrite it" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "apply", ok: false, changed: false}')" 3
+    fi
+
+    mkdir -p "$STATE_DIR" "$(dirname "$PW_CONF")" "$(dirname "$WP_CONF")" 2>/dev/null
+    exec 9>"$STATE_DIR/lock"
+    if ! flock -n 9; then
+      echo "audio-capability: another audio-capability run is in progress" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "apply", ok: false, changed: false}')" 4
+    fi
+
+    # Capture the ORIGINAL rate list exactly once, ever. A second apply must not
+    # overwrite it, or Revert would "restore" the value apply itself set.
+    if [[ ! -r $STATE_RATES ]]; then
+      printf '%s\n' "$(printf '%s' "$LIVE_RATES" | jq -r 'map(tostring) | join(" ")')" > "$STATE_RATES"
+    fi
+    RESTORE="$(jq -R -c '[splits("[ ,\t]+") | select(length > 0) | tonumber]' < "$STATE_RATES" 2>/dev/null)"
+    [[ -n $RESTORE ]] || RESTORE='[48000]'
+
+    ERRORS='[]'
+    add_error() { ERRORS="$(printf '%s' "$ERRORS" | jq -c --arg e "$1" '. + [$e]')"; }
+
+    # Files first, live second. A file that is on disk survives a reboot and can
+    # be reverted; metadata that was set but never written down evaporates at the
+    # next daemon restart and leaves nothing to undo. Staging to a temp file and
+    # renaming means a half-written config is never parsed by the daemon.
+    write_conf() { # <path> <body>
+      local tmp
+      tmp="$(mktemp "$(dirname "$1")/.audio-capability.XXXXXX")" || return 1
+      printf '%s\n' "$2" > "$tmp" || { rm -f "$tmp"; return 1; }
+      # Read the staged file back with the same SPA-JSON reader the daemons use.
+      # A config that does not parse is worse than no config at all: the daemon
+      # logs an error, ignores the file, and the panel would report success. This
+      # also catches a mistyped escape in a generated regex, which is otherwise
+      # the quietest way for this feature to fail.
+      if have spa-json-dump && ! spa-json-dump < "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 2
+      fi
+      mv -f "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+    }
+
+    PW_RESULT="written"
+    if ! write_conf "$PW_CONF" "$(gen_global_conf "$RESTORE")"; then
+      PW_RESULT="failed"
+      add_error "could not write $PW_CONF"
+    fi
+
+    WP_RESULT="written"
+    if ! write_conf "$WP_CONF" "$(gen_device_conf)"; then
+      WP_RESULT="failed"
+      add_error "could not write $WP_CONF"
+    fi
+
+    # The one genuinely live step: no restart, no interruption. Anything already
+    # playing keeps playing — the graph only switches rate while idle.
+    LIVE_RESULT="set"
+    if ! pw-metadata -n settings 0 clock.allowed-rates "$(rates_list "$UNION")" >/dev/null 2>&1; then
+      LIVE_RESULT="failed"
+      add_error "saved to disk, but the running graph could not be updated"
+    fi
+
+    OK=true; PARTIAL=false; CODE=0
+    if [[ $PW_RESULT == failed || $WP_RESULT == failed || $LIVE_RESULT == failed ]]; then
+      OK=false; CODE=4
+      [[ $PW_RESULT == written || $WP_RESULT == written || $LIVE_RESULT == set ]] && PARTIAL=true
+    fi
+
+    # A note added to $SURVEY_NOTES now would be too late — $SURVEY was built
+    # before the writes. Result notes are carried separately and merged at emit.
+    EXTRA_NOTES='[]'
+    if (( ${#PLAN_SINKS[@]} > 0 )) && [[ $EMIT_DEVICE_RULES -eq 1 ]]; then
+      EXTRA_NOTES="$(printf '%s' "$EXTRA_NOTES" | jq -c \
+        '. + ["Per-device rules take effect on the next device replug, or now with: systemctl --user restart wireplumber"]')"
+    fi
+
+    log_line "apply ok=$OK pw=$PW_RESULT wp=$WP_RESULT live=$LIVE_RESULT rates=[ $(printf '%s' "$UNION" | jq -r 'map(tostring) | join(" ")') ]"
+
+    emit "$(printf '%s' "$SURVEY" | jq -c \
+      --argjson ok "$OK" --argjson partial "$PARTIAL" \
+      --arg pw "$PW_RESULT" --arg wp "$WP_RESULT" --arg live "$LIVE_RESULT" \
+      --argjson errors "$ERRORS" --argjson extra "$EXTRA_NOTES" \
+      '. + {action: "apply", ok: $ok, partial: $partial, changed: true,
+            files: {global: $pw, device: $wp}, live: $live, errors: $errors,
+            notes: (.notes + $extra)}')" "$CODE"
+  fi
+
+  # ------------------------------------------------------------------- revert
+
+  if [[ $MODE == revert ]]; then
+    # All-or-nothing. Deleting one file and leaving a foreign one beside it
+    # would be worse than refusing: half a revert is a state nobody designed.
+    if [[ $PW_STATE == foreign || $WP_STATE == foreign ]]; then
+      echo "audio-capability: a target file exists that this tool did not generate — nothing removed" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "revert", ok: false, changed: false}')" 3
+    fi
+
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    exec 9>"$STATE_DIR/lock"
+    if ! flock -n 9; then
+      echo "audio-capability: another audio-capability run is in progress" >&2
+      emit "$(printf '%s' "$SURVEY" | jq -c '. + {action: "revert", ok: false, changed: false}')" 4
+    fi
+
+    # Prefer the recorded original. It is the only value that is actually the
+    # user's, rather than a guess about what stock looks like.
+    RESTORE="$RECORDED"
+    RESTORE_FROM="recorded original"
+    if [[ "$(printf '%s' "$RESTORE" | jq 'length')" == 0 ]]; then
+      RESTORE='[48000]'
+      RESTORE_FROM="the daemon default"
+    fi
+
+    REMOVED='[]'
+    CHANGED=false
+    if [[ $PW_STATE == ours ]]; then rm -f "$PW_CONF" && REMOVED="$(printf '%s' "$REMOVED" | jq -c --arg p "$PW_CONF" '. + [$p]')"; CHANGED=true; fi
+    if [[ $WP_STATE == ours ]]; then rm -f "$WP_CONF" && REMOVED="$(printf '%s' "$REMOVED" | jq -c --arg p "$WP_CONF" '. + [$p]')"; CHANGED=true; fi
+
+    LIVE_RESULT="set"
+    if ! pw-metadata -n settings 0 clock.allowed-rates "$(rates_list "$RESTORE")" >/dev/null 2>&1; then
+      LIVE_RESULT="failed"
+      echo "audio-capability: the config files are gone, but the running graph could not be reset" >&2
+    fi
+
+    EXTRA_NOTES='[]'
+    if [[ "$(printf '%s' "$REMOVED" | jq 'length')" -gt 0 ]]; then
+      EXTRA_NOTES="$(printf '%s' "$EXTRA_NOTES" | jq -c \
+        '. + ["Already-open devices keep their per-device rates until the next replug."]')"
+    fi
+
+    log_line "revert changed=$CHANGED live=$LIVE_RESULT restored_from=$RESTORE_FROM"
+
+    CODE=0; OK=true
+    [[ $LIVE_RESULT == failed ]] && { CODE=4; OK=false; }
+
+    emit "$(printf '%s' "$SURVEY" | jq -c \
+      --argjson changed "$CHANGED" --argjson removed "$REMOVED" --argjson ok "$OK" \
+      --argjson restore "$RESTORE" --arg from "$RESTORE_FROM" --arg live "$LIVE_RESULT" \
+      --argjson extra "$EXTRA_NOTES" \
+      '. + {action: "revert", ok: $ok, changed: $changed, removed: $removed,
+            restoredRates: $restore, restoredFrom: $from, live: $live,
+            notes: (.notes + $extra)}')" "$CODE"
+  fi
+fi
+
+# ---------------------------------------------------------------- resolve sink
+
+if [[ -n $MATCH ]]; then
+  SINK="$(pactl list sinks short 2>/dev/null | awk -v m="$MATCH" \
+    'tolower($2) ~ tolower(m) { print $2; exit }')"
+else
+  SINK="$(pactl get-default-sink 2>/dev/null)"
+fi
+
+# AUDIO_CAP_SINK is a testing/debugging override, the sink-side twin of
+# AUDIO_CAP_STREAM0: replay a report against a captured sink name. It is what
+# makes a saved Bluetooth pw-dump usable at all — the dump is keyed by node
+# name, which will never match the sink you are on when you replay it.
+[[ -n ${AUDIO_CAP_SINK:-} ]] && SINK="${AUDIO_CAP_SINK}"
+
+if [[ -z ${SINK:-} ]]; then
+  echo "audio-capability: no matching output sink" >&2
+  exit 1
+fi
+
+# `pactl list sinks` block for this sink -> the property lines we care about.
+SINK_BLOCK="$(pactl list sinks 2>/dev/null | awk -v s="$SINK" '
+  $0 ~ "^[ \t]*Name: " s "$" { inside = 1; print; next }
+  inside && /^Sink #/ { exit }
+  inside { print }
+')"
+
+prop() { # prop <key> -> value, first match
+  printf '%s\n' "$SINK_BLOCK" | awk -v k="$1" '
+    index($0, k " = ") { v = $0; sub(".*" k " = \"", "", v); sub("\".*", "", v); print v; exit }
+  '
+}
+
+SAMPLE_SPEC="$(printf '%s\n' "$SINK_BLOCK" | awk '/Sample Specification:/ { sub(/.*Sample Specification:[ \t]*/, ""); print; exit }')"
+CARD_IDX="$(prop alsa.card)"
+BUS="$(prop device.bus)"
+PROFILE_NAME="$(prop device.profile.name)"
+PROFILE_DESC="$(prop device.profile.description)"
+RESOLUTION_BITS="$(prop alsa.resolution_bits)"
+DEV_DESC="$(prop device.description)"
+
+# PipeWire node for this sink -> props (bt codec) and EnumFormat (capability).
+# One dump, reused: pw-dump serialises the whole graph, so calling it three
+# times (node lookup, codec, EnumFormat) triples the cost of the helper.
+#
+# AUDIO_CAP_PWDUMP is a testing/debugging override, the graph-side twin of
+# AUDIO_CAP_STREAM0: replay against a saved `pw-dump`. Capture one the first
+# time a Bluetooth sink is connected — `pw-dump > bt-sink.json` — and the codec
+# read path stops being untestable without a headset. Pair it with
+# AUDIO_CAP_SINK so the node lookup matches. It exercises the READ path only:
+# nothing about whether a headset accepts a switch is testable offline.
+if [[ -n ${AUDIO_CAP_PWDUMP:-} && -r ${AUDIO_CAP_PWDUMP} ]]; then
+  PWDUMP="$(cat "$AUDIO_CAP_PWDUMP")"
+else
+  PWDUMP="$(pw-dump 2>/dev/null)"
+fi
+NODE_ID="$(printf '%s' "$PWDUMP" | jq -r --arg s "$SINK" \
+  '.[] | select(.info.props["node.name"] == $s) | .id' 2>/dev/null | head -1)"
+
+BT_CODEC=""
+if [[ -n $NODE_ID ]]; then
+  BT_CODEC="$(printf '%s' "$PWDUMP" | jq -r --argjson n "$NODE_ID" \
+    '.[] | select(.id == $n) | .info.props["api.bluez5.codec"] // empty' 2>/dev/null | head -1)"
+fi
+
+# ------------------------------------------------------ bluetooth codec state
+# The codec is the one thing about a Bluetooth sink that the capability read
+# cannot describe: a bluez node has no /proc/asound entry at all, so there is no
+# `stream0` to enumerate. And PipeWire reports only what is in use —
+# `api.bluez5.codec` — with no `api.bluez5.codecs` anywhere, so the set a given
+# HEADSET supports is never enumerable from here. What is enumerable is what this
+# MACHINE can offer (KNOWN_CODECS), and the readback after a switch is the only
+# evidence about whether a headset took it.
+IS_BLUETOOTH=false
+[[ ${SINK:-} == bluez_output.* ]] && IS_BLUETOOTH=true
+
+# The preference is read back from the file we own rather than cached in the
+# panel, so a hand edit shows up as the truth it now is.
+PREF_CODECS='[]'
+PREF_QUALITY=""
+PREF_BITRATE=""
+if [[ -r $BT_PREF_CONF ]]; then
+  # `-R -s`, not bare `-R`. The file exists but carries no `bluez5.codecs` line
+  # whenever only a quality or bitrate knob has been set — the normal state after
+  # pressing one tuning row. sed then prints nothing, and `jq -R` on NO INPUT
+  # prints nothing at exit 0: it does not fail, so the `|| echo '[]'` never fires
+  # and the empty string travels on to `--argjson prefCodecs`, which jq rejects
+  # for the WHOLE argument list. Slurping makes no-input the string "", which
+  # splits to []. The fallback was written for jq failing; the failure here is
+  # jq succeeding quietly, which is the harder of the two to see.
+  PREF_CODECS="$(sed -n 's/.*bluez5\.codecs *= *\[\([^]]*\)\].*/\1/p' "$BT_PREF_CONF" | head -1 \
+    | jq -R -s -c '[splits("[ \t]+") | select(length > 0)]' 2>/dev/null || echo '[]')"
+  PREF_QUALITY="$(sed -n 's/.*bluez5\.a2dp\.ldac\.quality *= *"\([^"]*\)".*/\1/p' "$BT_PREF_CONF" | head -1)"
+  PREF_BITRATE="$(sed -n 's/.*bluez5\.a2dp\.aac\.bitratemode *= *\([0-9]*\).*/\1/p' "$BT_PREF_CONF" | head -1)"
+fi
+
+# ------------------------------------------------------- in use (negotiated)
+
+# "s32le 2ch 48000Hz" -> format / channels / rate
+IN_FORMAT="$(printf '%s' "$SAMPLE_SPEC" | awk '{print $1}')"
+IN_RATE="$(printf '%s' "$SAMPLE_SPEC" | grep -oE '[0-9]+Hz' | tr -d 'Hz')"
+# Bit width of the *negotiated container*, read off the format name (s24_3le ->
+# 24). Deliberately not alsa.resolution_bits: on SOF HDA that property is a
+# static UCM hint, identical ("16") for every sink on the card regardless of
+# what is actually open, so it cannot be presented as the in-use depth.
+IN_BITS="$(printf '%s' "$IN_FORMAT" | grep -oE '[0-9]+' | head -1)"
+
+# ------------------------------------------------- capability: USB stream0
+# Authoritative when the device is USB: every altset with its exact format,
+# bit depth and rate list, plus native-DSD flags. No other source has this.
+
+# AUDIO_CAP_STREAM0 is a testing/debugging override: point it at a saved stream0
+# to exercise the USB parser on a machine with no USB DAC attached.
+STREAM0=""
+if [[ -n ${AUDIO_CAP_STREAM0:-} && -r ${AUDIO_CAP_STREAM0} ]]; then
+  STREAM0="$AUDIO_CAP_STREAM0"
+elif [[ -n $CARD_IDX && -r "/proc/asound/card${CARD_IDX}/stream0" ]]; then
+  STREAM0="/proc/asound/card${CARD_IDX}/stream0"
+fi
+
+CAP_SOURCE=""
+CAP_ALTSETS='[]'
+CAP_RATES='[]'
+CAP_FORMATS='[]'
+DSD_NATIVE=false
+DSD_DOP=false
+DSD_BITREV=false
+
+if [[ -n $STREAM0 ]]; then
+  CAP_SOURCE="stream0"
+
+  ROWS="$(altset_rows "$STREAM0" 2>/dev/null)"
+
+  CAP_ALTSETS="$(printf '%s\n' "$ROWS" | jq -R -s '
+    split("\n") | map(select(length > 0) | split("\t") |
+      { format: .[0], bits: (.[1] | tonumber? // .[1]),
+        rates: (.[2] | split(",") | map(gsub("^ +| +$"; "") | tonumber?) | map(select(. != null))),
+        dsd: (if .[3] == "-" then null else .[3] end) })' 2>/dev/null)"
+
+  CAP_RATES="$(printf '%s' "$CAP_ALTSETS" | jq -c '[.[].rates[]] | unique' 2>/dev/null)"
+  CAP_FORMATS="$(printf '%s' "$CAP_ALTSETS" | jq -c '[.[].format] | unique' 2>/dev/null)"
+
+  if printf '%s\n' "$ROWS" | grep -qi 'DSD raw:'; then
+    DSD_LINE="$(printf '%s\n' "$ROWS" | grep -i 'DSD raw:' | head -1)"
+    grep -qi 'DOP=1' <<<"$DSD_LINE" && DSD_DOP=true
+    grep -qi 'bitrev=1' <<<"$DSD_LINE" && DSD_BITREV=true
+  fi
+  # A non-PCM, non-DSD altset (Format: SPECIAL) is how native DSD presents.
+  printf '%s' "$CAP_FORMATS" | grep -q 'SPECIAL' && DSD_NATIVE=true
+else
+  # Not USB (SOF/HDA, PCI, or Bluetooth): no stream0 exists. PipeWire's own
+  # EnumFormat range is the best available statement of capability.
+  CAP_SOURCE="enumformat"
+  if [[ -n $NODE_ID ]]; then
+    EF="$(printf '%s' "$PWDUMP" | jq -c --argjson n "$NODE_ID" \
+      '.[] | select(.id == $n) | .info.params.EnumFormat[0] // null' 2>/dev/null)"
+  fi
+  if [[ -n ${EF:-} && $EF != null ]]; then
+    # `format` is an object OF CHOICES on an ALSA node — {"default":"S32LE",
+    # "alt1":"S24_32LE"} — and a bare SCALAR on a bluez one ("S16LE"). The first
+    # shape needs to_entries, and to_entries on the second is a jq ERROR. That
+    # error was invisible: $(...) came back empty, the empty string reached
+    # `--argjson capFormats ''` in the report below, jq then refused the WHOLE
+    # argument list, and the tool printed nothing at all at exit 0. A connected
+    # headset therefore kept rendering whichever report had parsed last — a
+    # codec it had already been switched off. This is the same scalar-or-object
+    # split `rate` has on the next line, and it needs the same explicit branch.
+    CAP_FORMATS="$(printf '%s' "$EF" | jq -c '
+      .format | if type == "object"
+                then ([to_entries[] | .value] | unique)
+                else ([.] | unique) end' 2>/dev/null)"
+    # `rate` is a scalar when the device is fixed-rate, an object when it ranges.
+    CAP_RATES="$(printf '%s' "$EF" | jq -c '
+      .rate | if type == "object"
+              then ([.min, .max] | map(select(. != null)))
+              else [.] end' 2>/dev/null)"
+  fi
+fi
+
+# Belt and braces for the failure above, because it is not specific to `format`:
+# every one of these three is passed to --argjson, and "" is not valid JSON, so
+# ONE unparseable field costs the ENTIRE report rather than that one field.
+# "Not known" is [] here and never the empty string.
+: "${CAP_ALTSETS:=[]}" "${CAP_RATES:=[]}" "${CAP_FORMATS:=[]}"
+
+# ------------------------------------------------------------- clock policy
+# This is the gate. A device can advertise 384 kHz and still run at 48 kHz
+# because the graph only ever runs at the rates in clock.allowed-rates.
+
+META="$(pw-metadata -n settings 2>/dev/null)"
+CLOCK_RATE="$(printf '%s\n' "$META" | sed -n "s/.*key:'clock.rate' value:'\([^']*\)'.*/\1/p" | head -1)"
+ALLOWED="$(printf '%s\n' "$META" | sed -n "s/.*key:'clock.allowed-rates' value:'\[\([^]]*\)\]'.*/\1/p" | head -1)"
+QUANTUM="$(printf '%s\n' "$META" | sed -n "s/.*key:'clock.quantum' value:'\([^']*\)'.*/\1/p" | head -1)"
+# `clock.force-rate` is the manual pin, and 0 means "not pinned" rather than a
+# rate, so it is normalised to empty here and to null in the JSON. Reporting 0 as
+# a rate would make the panel offer a 0 Hz option.
+FORCED_RAW="$(printf '%s\n' "$META" | sed -n "s/.*key:'clock.force-rate' value:'\([^']*\)'.*/\1/p" | head -1)"
+FORCED=""
+if [[ -n ${FORCED_RAW:-} && $FORCED_RAW =~ ^[0-9]+$ ]] && (( FORCED_RAW > 0 )); then
+  FORCED="$FORCED_RAW"
+fi
+# `-R -s` for the same reason as PREF_CODECS above: with no `clock.allowed-rates`
+# in the metadata, `-R` alone would print nothing rather than [], and an empty
+# string is not a JSON array.
+ALLOWED_JSON="$(printf '%s' "$ALLOWED" | jq -R -s -c '[splits("[ ,\t]+") | select(length > 0) | tonumber]' 2>/dev/null || echo '[]')"
+
+# --------------------------------------------------------- hardware volume
+# A real hw control means volume can move without attenuating the sample data,
+# which is what bit-perfect playback needs.
+
+# `amixer scontrols` prints only the short name ('Master',0); the word "Volume"
+# lives in the full name, so query the full control list instead.
+HW_VOLUME=false
+if [[ -n $CARD_IDX ]] && have amixer; then
+  amixer -c "$CARD_IDX" controls 2>/dev/null | grep -qi 'Playback Volume' && HW_VOLUME=true
+fi
+
+# ----------------------------------------------------------------- warnings
+# The product value: where capability and reality disagree.
+
+WARNINGS='[]'
+add_warning() { WARNINGS="$(printf '%s' "$WARNINGS" | jq -c --arg w "$1" '. + [$w]' 2>/dev/null)"; }
+
+CAP_MAX="$(printf '%s' "$CAP_RATES" | jq -c 'max // empty' 2>/dev/null)"
+CAP_MIN="$(printf '%s' "$CAP_RATES" | jq -c 'min // empty' 2>/dev/null)"
+CAP_MAX_BITS="$(printf '%s' "$CAP_ALTSETS" | jq -c '[.[].bits | numbers] | max // empty' 2>/dev/null)"
+
+# Warnings are shown verbatim in the bar panel, so they are written the way a
+# person would say them out loud: what is happening, then what the device could
+# do instead. No property names, no "graph", no "negotiated" — those belong in
+# the panel's Details view, not in the sentence that tells you something is off.
+khz() { awk -v h="${1:-0}" 'BEGIN { k = h / 1000; printf (k == int(k) ? "%d" : "%.1f"), k }'; }
+
+if [[ -n $IN_RATE && -n $CAP_MAX && $CAP_MAX != null ]] && (( IN_RATE < CAP_MAX )); then
+  add_warning "Playing at $(khz "$IN_RATE") kHz, but this device can do up to $(khz "$CAP_MAX") kHz."
+fi
+
+if (( $(printf '%s' "$ALLOWED_JSON" | jq -c 'length') <= 1 )); then
+  add_warning "Your system is set to use only $(khz "$(printf '%s' "$ALLOWED_JSON" | jq -r '.[0] // 0')") kHz, so a higher rate can't be used."
+fi
+
+if [[ $DSD_NATIVE == true ]]; then
+  if ! printf '%s' "$CAP_FORMATS" | grep -qi 'dsd'; then
+    add_warning "This device supports DSD, but it is not being offered."
+  fi
+fi
+
+# Compare the NEGOTIATED depth against what the hardware offers — never
+# alsa.resolution_bits. That property is a static card hint, not a measurement:
+# on the internal SOF HDA it reads 16 for every sink on the card, and on the
+# iBasso it stayed 16 while the negotiated format was s32le. Reading it here
+# made the panel contradict its own Details row — "Playing 16-bit" printed
+# beside "s32le (32-bit)" — which is precisely the class of error this warning
+# exists to catch.
+if [[ $CAP_SOURCE == "stream0" && -n $IN_BITS && -n $CAP_MAX_BITS && $CAP_MAX_BITS != null ]] \
+   && (( IN_BITS < $CAP_MAX_BITS )); then
+  add_warning "Playing ${IN_BITS}-bit, but this device can do ${CAP_MAX_BITS}-bit."
+fi
+
+# --------------------------------------------------------------- pin the rate
+# `clock.force-rate` is the one lever that changes the rate without a restart and
+# without touching a config file: 0 releases it, any other value pins the graph.
+# It sits ON TOP of the allowed set, so a rate the clock cannot reach is refused
+# here rather than silently ignored by the daemon — the failure mode of "set a
+# number and nothing happens" is exactly what this tool exists to make visible.
+if [[ $MODE == rate ]]; then
+  WANT="${RATE_ARG,,}"          # `auto` | a number
+  TARGET=""
+  case "$WANT" in
+    ""|auto|release|off) TARGET=0 ;;
+    *[!0-9]*)
+      echo "audio-capability: --rate wants 'auto' or a rate in Hz, not '$RATE_ARG'" >&2
+      emit '{"action":"rate","ok":false,"error":"usage"}' 2 ;;
+    *) TARGET="$WANT" ;;
+  esac
+
+  if (( TARGET > 0 )); then
+    if ! [[ -n $CAP_RATES ]] || ! printf '%s' "$CAP_RATES" | jq -e --argjson r "$TARGET" \
+         'index($r) != null' >/dev/null 2>&1; then
+      echo "audio-capability: this device does not advertise ${TARGET} Hz — it advertises $(printf '%s' "$CAP_RATES" | jq -c . 2>/dev/null || echo '[]')" >&2
+      emit '{"action":"rate","ok":false,"error":"rate not supported by this device"}' 3
+    fi
+    if ! printf '%s' "$ALLOWED_JSON" | jq -e --argjson r "$TARGET" \
+         'index($r) != null' >/dev/null 2>&1; then
+      echo "audio-capability: ${TARGET} Hz is not in the graph's allowed rates $(printf '%s' "$ALLOWED_JSON" | jq -c .) — apply the fix first" >&2
+      emit '{"action":"rate","ok":false,"error":"rate not in clock.allowed-rates"}' 3
+    fi
+  fi
+
+  RC=0
+  pw-metadata -n settings 0 clock.force-rate "$TARGET" >/dev/null 2>&1 || RC=$?
+
+  # Read it back rather than trusting the write: the property can be accepted and
+  # still not take, and a pin that did not take is the whole failure mode here.
+  AFTER_RAW="$(pw-metadata -n settings 2>/dev/null \
+    | sed -n "s/.*key:'clock.force-rate' value:'\([^']*\)'.*/\1/p" | head -1)"
+  AFTER="${AFTER_RAW:-}"
+
+  OK=true; CODE=0
+  if [[ $RC -ne 0 ]]; then
+    OK=false; CODE=4
+    echo "audio-capability: pw-metadata failed to set clock.force-rate" >&2
+  elif [[ "$AFTER" != "$TARGET" ]]; then
+    OK=false; CODE=4
+    echo "audio-capability: asked for clock.force-rate=$TARGET but it reads $AFTER" >&2
+  fi
+
+  log_line "rate forced=${TARGET} readback=${AFTER:-none} ok=$OK"
+
+  emit "$(jq -cn --argjson ok "$OK" --arg want "$TARGET" --arg after "$AFTER" '
+    { action: "rate", ok: $ok,
+      requested: (($want | tonumber?) // 0),
+      forced: (if ($after | tonumber? // 0) > 0 then ($after | tonumber) else null end),
+      pinned: (($after | tonumber? // 0) > 0) }')" "$CODE"
+fi
+
+# ---------------------------------------------------- switch codec (live, gated)
+# The live switch on an already-open A2DP link. Offered on evidence rather than on
+# documentation — see EMIT_BLUEZ_CODEC_SWITCH for why that distinction is load-
+# bearing here and not paranoia.
+if [[ $MODE == codec ]]; then
+  WANT="${CODEC_ARG,,}"
+
+  # Ordered argument-first: a typo in the codec name is a mistake worth reporting
+  # wherever it was made, so it is checked before anything about the device. Only
+  # then does applicability (is this even a Bluetooth sink) and build capability
+  # (is live switching enabled) come into it.
+  if ! codec_known "$WANT"; then
+    echo "audio-capability: '$CODEC_ARG' is not a codec this build can load; it offers: $KNOWN_CODECS" >&2
+    emit "$(jq -cn '{action:"codec",ok:false,error:"unknown codec"}')" 3
+  fi
+  if [[ $IS_BLUETOOTH != true ]]; then
+    echo "audio-capability: --codec needs a Bluetooth sink, and '$SINK' is not one" >&2
+    emit "$(jq -cn '{action:"codec",ok:false,error:"not a bluetooth sink"}')" 3
+  fi
+  if [[ $EMIT_BLUEZ_CODEC_SWITCH -ne 1 ]]; then
+    echo "audio-capability: live codec switching is off on this build; use --codec-pref codec=${CODEC_ARG:-?}, which needs no switch" >&2
+    emit "$(jq -cn '{action:"codec",ok:false,error:"live switching not enabled on this build"}')" 3
+  fi
+
+  BEFORE="${BT_CODEC:-}"
+  if [[ $BEFORE == "$WANT" ]]; then
+    log_line "codec switch want=$WANT already=$BEFORE ok=true"
+    emit "$(jq -cn --arg c "$WANT" \
+      '{action:"codec", ok:true, requested:$c, codec:$c, switched:false, already:true}')" 0
+  fi
+
+  # The target is the CARD (the bluez5 device), not the media node. Verified on
+  # 2026-10-13 with the XM6: writing the enum to the card moves the codec, and
+  # writing it to the node does not.
+  BT_DEV_ID="$(printf '%s' "$PWDUMP" | jq -r --argjson n "${NODE_ID:-0}" \
+    '.[] | select(.id == $n) | .info.props["device.id"] // empty' 2>/dev/null | head -1)"
+
+  # Found BY NAME, never by a remembered id. A successful switch tears the media
+  # node down and creates a new one, so the id in hand is stale the moment the
+  # write lands: the first implementation read the node back by stored id and
+  # therefore reported `null` for a switch that had actually SUCCEEDED. The name
+  # (`bluez_output.<mac>.<n>`) is the part that survives.
+  readback_codec() {
+    pw-dump 2>/dev/null | jq -r --arg n "$SINK" \
+      '.[] | select(.info.props["node.name"] == $n) | .info.props["api.bluez5.codec"] // empty' \
+      2>/dev/null | head -1
+  }
+
+  # If the exact name is not back yet, accept any bluez_output node rather than
+  # giving up: the suffix is a route index that a renegotiation is entitled to
+  # change, and reporting "did not change" because of a moved suffix would be the
+  # same class of false negative this fix exists to remove.
+  readback_codec_any() {
+    pw-dump 2>/dev/null | jq -r \
+      '.[] | select(.info.props["node.name"]? // "" | test("^bluez_output\\."))
+           | .info.props["api.bluez5.codec"] // empty' 2>/dev/null | head -1
+  }
+
+  WANT_ENUM="$(codec_enum "$WANT")"
+  AFTER="$BEFORE"; TARGET=""; RC=0
+  if [[ -z $WANT_ENUM ]]; then
+    echo "audio-capability: $WANT has no SPA codec ordinal — this build knows the name but cannot request it" >&2
+  elif [[ -z $BT_DEV_ID ]]; then
+    echo "audio-capability: no bluez card behind '$SINK' — nothing to write the codec to" >&2
+  else
+    pw-cli set-param "$BT_DEV_ID" Props "{ \"bluetoothAudioCodec\": $WANT_ENUM }" >/dev/null 2>&1 || RC=$?
+    TARGET="$BT_DEV_ID"
+
+    # Poll rather than sample once. The node is away for the length of the
+    # renegotiation, and a single immediate read catches precisely that gap —
+    # which is what made a working switch look like a dead one.
+    for _ in 1 2 3 4 5 6 7 8; do
+      sleep 0.4
+      AFTER="$(readback_codec)"
+      [[ -z $AFTER ]] && AFTER="$(readback_codec_any)"
+      [[ $AFTER == "$WANT" ]] && break
+    done
+    [[ -z $AFTER ]] && AFTER="$BEFORE"
+  fi
+
+  OK=false; CODE=4
+  if [[ $AFTER == "$WANT" ]]; then
+    OK=true; CODE=0
+  elif [[ $AFTER == "$BEFORE" ]]; then
+    echo "audio-capability: the codec did not change (still ${AFTER:-unknown}) — this build accepts the write without acting on it" >&2
+  else
+    # The plugin's own recovery path is "failed to switch codec (%d), setting
+    # basic profile". Landing on SBC when LDAC was asked for is a fallback, and it
+    # is reported as one — never as the switch having worked.
+    echo "audio-capability: asked for $WANT and got ${AFTER:-unknown} — the link fell back" >&2
+  fi
+
+  log_line "codec switch want=$WANT before=${BEFORE:-none} after=${AFTER:-none} target=${TARGET:-none} rc=$RC ok=$OK"
+  emit "$(jq -cn --argjson ok "$OK" --arg want "$WANT" --arg before "${BEFORE:-}" \
+    --arg after "${AFTER:-}" --arg target "$TARGET" \
+    '{action:"codec", ok:$ok, requested:$want,
+      before: (if $before == "" then null else $before end),
+      codec:  (if $after  == "" then null else $after  end),
+      switched: ($ok and ($after != $before)),
+      fellBack: ($ok and ($after != $want)),
+      target: (if $target == "" then null else $target end)}')" "$CODE"
+fi
+
+# ----------------------------------------------- codec preference (durable half)
+# `bluez5.codecs` is an ORDER, applied when a device connects — there is no
+# documented runtime setter for it. That is precisely why this is the reliable
+# half of the feature and `--codec` is the gated one.
+if [[ $MODE == codepref ]]; then
+  SPEC="${CODEC_PREF,,}"
+
+  # Never destroy a file this tool did not generate, same rule as --revert.
+  if [[ -e $BT_PREF_CONF ]] && ! head -1 "$BT_PREF_CONF" 2>/dev/null | grep -qF "$GEN_MARK"; then
+    echo "audio-capability: $BT_PREF_CONF exists and this tool did not generate it — refusing to touch it" >&2
+    emit "$(jq -cn '{action:"codec-pref",ok:false,error:"foreign file"}')" 3
+  fi
+
+  if [[ $SPEC == none || $SPEC == off || $SPEC == clear ]]; then
+    rm -f "$BT_PREF_CONF" 2>/dev/null
+    log_line "codec-pref cleared"
+    emit "$(jq -cn '{action:"codec-pref",ok:true,cleared:true,codecs:[],quality:null,bitrate:null}')" 0
+  fi
+
+  KEY="${SPEC%%=*}"
+  VAL="${SPEC#*=}"
+  if [[ $KEY == "$SPEC" || -z $VAL ]]; then
+    echo "audio-capability: --codec-pref wants codec=<name>, quality=<auto|hq|sq|mq>, bitrate=<0-5> or none" >&2
+    emit "$(jq -cn '{action:"codec-pref",ok:false,error:"usage"}')" 2
+  fi
+
+  # Start from what is already on disk so each knob rewrites only its own key —
+  # otherwise setting the LDAC quality would silently forget the codec order.
+  NEW_CODECS="$PREF_CODECS"
+  NEW_QUALITY="${PREF_QUALITY:-auto}"
+  NEW_BITRATE="${PREF_BITRATE:-0}"
+
+  case "$KEY" in
+    codec)
+      if ! codec_known "$VAL"; then
+        echo "audio-capability: '$VAL' is not a codec this build can load; it offers: $KNOWN_CODECS" >&2
+        emit "$(jq -cn '{action:"codec-pref",ok:false,error:"unknown codec"}')" 3
+      fi
+      # Chosen first, then every other codec this build knows, in build order.
+      # The list selects among ENABLED codecs, so listing only the chosen one
+      # would disable the rest and break any headset that cannot do it — the
+      # opposite of a preference. Chosen-first gets the wanted codec where it is
+      # supported and falls through cleanly where it is not.
+      NEW_CODECS="$(jq -cn --arg c "$VAL" --arg all "$KNOWN_CODECS" \
+        '[$c] + ([$all | splits("[ \t]+") | select(length > 0) | select(. != $c)])')"
+      # `splits` is a STREAM, so the right-hand side has to be collected before it
+      # can be concatenated — without the brackets this is `array + string`, which
+      # jq rejects at runtime. And a jq failure here would otherwise leave
+      # NEW_CODECS empty and sail on to emit a blank line at exit 0, which breaks
+      # the one promise this tool makes: stdout is ALWAYS one JSON object.
+      if ! printf '%s' "$NEW_CODECS" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        echo "audio-capability: could not build the codec order — nothing was written" >&2
+        emit "$(jq -cn '{action:"codec-pref",ok:false,error:"could not build codec order"}')" 4
+      fi
+      ;;
+    quality)
+      case "$VAL" in
+        auto|hq|sq|mq) ;;
+        *) echo "audio-capability: LDAC quality is auto, hq, sq or mq — not '$VAL'" >&2
+           emit "$(jq -cn '{action:"codec-pref",ok:false,error:"unknown quality"}')" 3 ;;
+      esac
+      NEW_QUALITY="$VAL"
+      ;;
+    bitrate)
+      case "$VAL" in
+        [0-5]) ;;
+        *) echo "audio-capability: AAC bitrate mode is 0 (cbr) or 1-5 — not '$VAL'" >&2
+           emit "$(jq -cn '{action:"codec-pref",ok:false,error:"unknown bitratemode"}')" 3 ;;
+      esac
+      NEW_BITRATE="$VAL"
+      ;;
+    *)
+      echo "audio-capability: unknown --codec-pref key '$KEY' (codec, quality, bitrate, none)" >&2
+      emit "$(jq -cn '{action:"codec-pref",ok:false,error:"unknown key"}')" 2
+      ;;
+  esac
+
+  # No codec chosen yet means no `bluez5.codecs` line at all, rather than an empty
+  # one. An empty list is not "no preference", it is "no codecs", and writing it
+  # would disable every codec on the machine — the same trap the rate layer avoids
+  # by refusing to emit an empty allowed-rates array.
+  CODECS_LINE=""
+  CODEC_COUNT="$(printf '%s' "$NEW_CODECS" | jq 'length' 2>/dev/null || echo 0)"
+  if [[ ${CODEC_COUNT:-0} -gt 0 ]]; then
+    CODECS_LINE="$(printf '%s' "$NEW_CODECS" | jq -r 'join(" ")' 2>/dev/null)"
+  fi
+
+  # Two codecs are governed by a per-HEADSET hardware database rather than by the
+  # list alone. This build's own bluetooth.conf says so outright: "These features do
+  # not work on all headsets, so they are enabled by default based on the hardware
+  # database. They can also be forced on/off for all devices by the following
+  # options: bluez5.enable-sbc-xq …". Picking one from the panel IS that force — a
+  # user who asks for SBC-XQ by name is overriding the database — so the flag is
+  # written with the choice. Without it the press is accepted, stored, and then
+  # silently not honoured on any headset the database did not already allow, which
+  # is exactly the class of quiet no-op this tool exists to expose.
+  #
+  # Recomputed from the CURRENT choice on every write, so switching away from
+  # SBC-XQ does not leave a stale force switched on behind it. `enable-faststream`
+  # has no example in the shipped conf; its name comes from the plugin's own
+  # property table, where it sits beside the three documented flags.
+  FORCE_FLAGS=""
+  CHOSEN_CODEC="$(printf '%s' "$NEW_CODECS" | jq -r 'if type == "array" then (.[0] // empty) else empty end' 2>/dev/null)"
+  case "$CHOSEN_CODEC" in
+    sbc_xq)                       FORCE_FLAGS="  bluez5.enable-sbc-xq = true" ;;
+    faststream|faststream_duplex) FORCE_FLAGS="  bluez5.enable-faststream = true" ;;
+  esac
+
+  mkdir -p "$(dirname "$BT_PREF_CONF")" 2>/dev/null
+  TMP="$BT_PREF_CONF.tmp.$$"
+  {
+    printf '%s — do not edit. Revert: audio-capability --codec-pref none\n' "$GEN_MARK"
+    printf '# Written %s.\n' "$(date -Is)"
+    printf '# Applies to the NEXT connect: bluez5.codecs is a monitor property, so\n'
+    printf '# nothing here can take effect on an already-open A2DP link.\n'
+    if [[ -n $CODECS_LINE ]]; then
+      printf 'monitor.bluez.properties = {\n'
+      printf '  bluez5.codecs = [ %s ]\n' "$CODECS_LINE"
+      [[ -n $FORCE_FLAGS ]] && printf '%s\n' "$FORCE_FLAGS"
+      printf '}\n\n'
+    fi
+    printf 'monitor.bluez.rules = [\n'
+    printf '  {\n'
+    printf '    matches = [ { device.name = "~bluez_card[.]" } ]\n'
+    printf '    actions = { update-props = {\n'
+    printf '      bluez5.a2dp.ldac.quality = "%s"\n' "$NEW_QUALITY"
+    printf '      bluez5.a2dp.aac.bitratemode = %s\n' "$NEW_BITRATE"
+    printf '    } }\n'
+    printf '  }\n'
+    printf ']\n'
+  } > "$TMP" 2>/dev/null
+
+  # Parse it before trusting it — a generated config that does not load is a
+  # setting that silently does nothing, which is the failure this tool exists to
+  # expose rather than to commit.
+  if ! spa-json-dump "$TMP" >/dev/null 2>&1; then
+    rm -f "$TMP" 2>/dev/null
+    echo "audio-capability: the generated preference does not parse — nothing was written" >&2
+    emit "$(jq -cn '{action:"codec-pref",ok:false,error:"generated file did not parse"}')" 4
+  fi
+  if ! mv -f "$TMP" "$BT_PREF_CONF" 2>/dev/null; then
+    rm -f "$TMP" 2>/dev/null
+    echo "audio-capability: could not write $BT_PREF_CONF" >&2
+    emit "$(jq -cn '{action:"codec-pref",ok:false,error:"write failed"}')" 4
+  fi
+
+  log_line "codec-pref codecs=[${CODECS_LINE}] quality=$NEW_QUALITY bitrate=$NEW_BITRATE${FORCE_FLAGS:+ force=[${FORCE_FLAGS#  }]}"
+  emit "$(jq -cn --argjson c "$NEW_CODECS" --arg q "$NEW_QUALITY" --argjson b "$NEW_BITRATE" \
+    '{action:"codec-pref", ok:true, pendingConnect:true,
+      codecs: $c, quality: $q, bitrate: $b}')" 0
+fi
+
+# ------------------------------------------------------------------- output
+
+# Every JSON-valued argument below is handed to `--argjson`, and jq rejects the
+# ENTIRE argument list when one of them will not parse — one bad field costs the
+# report, not that field. Two of these have already been found the hard way, both
+# through the same door: `$( )` around a pipeline that printed nothing hands back
+# the empty string, because jq on NO INPUT succeeds and prints nothing rather
+# than failing. The first was `capFormats` (a scalar where an object was
+# assumed), the second `prefCodecs` (a preference file with no codec line in it).
+# So each one is checked here, BY NAME, before the single call that would
+# otherwise swallow them all — an internal error that names its own field.
+for _json_var in CAP_ALTSETS CAP_RATES CAP_FORMATS ALLOWED_JSON WARNINGS PREF_CODECS; do
+  _json_val="${!_json_var:-}"
+  # Emptiness is checked separately and deliberately: `jq .` parses an empty
+  # stream successfully, so the parse check alone would wave "" straight through.
+  if [[ -z $_json_val ]] || ! printf '%s' "$_json_val" | jq . >/dev/null 2>&1; then
+    echo "audio-capability: internal error — \$${_json_var} is not valid JSON: [${_json_val}]" >&2
+    exit 5
+  fi
+done
+unset _json_var _json_val
+
+jq -n \
+  --arg sink "$SINK" \
+  --arg label "${DEV_DESC:-$SINK}" \
+  --arg bus "${BUS:-unknown}" \
+  --arg card "${CARD_IDX:-}" \
+  --arg profile "${PROFILE_NAME:-}" \
+  --arg profileDesc "${PROFILE_DESC:-}" \
+  --arg nodeId "${NODE_ID:-}" \
+  --arg capSource "$CAP_SOURCE" \
+  --argjson altsets "$CAP_ALTSETS" \
+  --argjson capRates "$CAP_RATES" \
+  --argjson capFormats "$CAP_FORMATS" \
+  --argjson dsdNative "$DSD_NATIVE" \
+  --argjson dsdDop "$DSD_DOP" \
+  --argjson dsdBitrev "$DSD_BITREV" \
+  --arg inRate "${IN_RATE:-}" \
+  --arg inFormat "${IN_FORMAT:-}" \
+  --arg inBits "${IN_BITS:-}" \
+  --arg sampleSpec "$SAMPLE_SPEC" \
+  --arg resolutionBits "${RESOLUTION_BITS:-}" \
+  --arg btCodec "$BT_CODEC" \
+  --arg clockRate "${CLOCK_RATE:-}" \
+  --arg forcedRate "${FORCED:-}" \
+  --argjson allowedRates "$ALLOWED_JSON" \
+  --arg quantum "${QUANTUM:-}" \
+  --argjson hwVolume "$( [[ $HW_VOLUME == true ]] && echo true || echo false )" \
+  --argjson warnings "$WARNINGS" \
+  --argjson bt "$( [[ $IS_BLUETOOTH == true ]] && echo true || echo false )" \
+  --argjson knownCodecs "$(printf '%s' "$KNOWN_CODECS" | jq -R -c '[splits("[ \t]+") | select(length > 0)]')" \
+  --argjson prefCodecs "$PREF_CODECS" \
+  --arg prefQuality "${PREF_QUALITY:-}" \
+  --arg prefBitrate "${PREF_BITRATE:-}" \
+  --argjson canSwitch "$( [[ $EMIT_BLUEZ_CODEC_SWITCH -eq 1 ]] && echo true || echo false )" \
+  --arg prefPath "$( [[ -e $BT_PREF_CONF ]] && printf '%s' "$BT_PREF_CONF" || printf '' )" \
+  '{
+    device: { sink: $sink, label: $label, bus: $bus, card: $card,
+              profile: $profile, profileDesc: $profileDesc, nodeId: $nodeId },
+    capability: { source: $capSource, rates: $capRates, formats: $capFormats,
+                  altsets: $altsets,
+                  dsd: { native: $dsdNative, dop: $dsdDop, bitrev: $dsdBitrev } },
+    inUse: { rate: ($inRate | tonumber? // null),
+             format: ($inFormat | select(length > 0) // null),
+             bits: ($inBits | tonumber? // null),
+             sampleSpec: ($sampleSpec | select(length > 0) // null),
+             resolutionBits: ($resolutionBits | tonumber? // null),
+             btCodec: ($btCodec | select(length > 0) // null) },
+    policy: { clockRate: ($clockRate | tonumber? // null),
+              allowedRates: $allowedRates,
+              forcedRate: ($forcedRate | tonumber? // null),
+              quantum: ($quantum | tonumber? // null) },
+    # `known` is what this MACHINE can offer, not what the headset supports —
+    # there is no way to enumerate the latter (no api.bluez5.codecs on this
+    # build). `preferred` is read back from the generated file, so it is empty
+    # until a codec has actually been chosen.
+    codec: { bluetooth: $bt,
+             current: ($btCodec | select(length > 0) // null),
+             known: $knownCodecs,
+             preferred: $prefCodecs,
+             ldacQuality: ($prefQuality | select(length > 0) // null),
+             aacBitrateMode: ($prefBitrate | tonumber? // null),
+             prefPath: ($prefPath | select(length > 0) // null),
+             canSwitch: $canSwitch },
+    volume: { hw: $hwVolume },
+    warnings: $warnings
+  }' > /tmp/.audio-capability.json.$$ 2>/tmp/.audio-capability.err.$$
+
+# An empty here means jq refused the argument list outright — one unparseable
+# --argjson, one field the graph did not carry in the shape this expects. That
+# used to be indistinguishable from success: `|| cat` faithfully printed the
+# empty file, the exit code stayed 0, and the panel only raises an error when it
+# has NEVER loaded, so it went on rendering the last report that parsed. Silence
+# that looks like agreement is the exact failure this widget exists to expose,
+# so it is a failure here: on stderr, with an exit code of its own, and with the
+# empty stdout left empty rather than dressed up as a report.
+if [[ ! -s /tmp/.audio-capability.json.$$ ]]; then
+  echo "audio-capability: could not build the report — $(head -1 /tmp/.audio-capability.err.$$ 2>/dev/null)" >&2
+  rm -f /tmp/.audio-capability.json.$$ /tmp/.audio-capability.err.$$
+  exit 5
+fi
+
+if [[ $PRETTY -eq 1 ]]; then
+  jq . /tmp/.audio-capability.json.$$ 2>/dev/null || cat /tmp/.audio-capability.json.$$
+else
+  jq -c . /tmp/.audio-capability.json.$$ 2>/dev/null || cat /tmp/.audio-capability.json.$$
+fi
+rm -f /tmp/.audio-capability.json.$$ /tmp/.audio-capability.err.$$
