@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.1
+
+- Holding the large tile shows Deck's progress hairline, like every other tile (needs Deck 0.10.3).
+
 ## 0.7.0
 
 - **The helper ships with the plugin.** `scripts/audio-capability` moved in from

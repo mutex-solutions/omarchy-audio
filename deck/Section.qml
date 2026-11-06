@@ -34,6 +34,8 @@ Item {
 
     Item {
       id: full
+      signal holdStarted()
+      signal holdEnded()
       readonly property var st: s.state
 
       // The background is the page door; the mute button and the slider are
@@ -45,18 +47,24 @@ Item {
         onPressed: {
           held = false
           pageHold.restart()
+          full.holdStarted()
         }
         onReleased: {
           pageHold.stop()
+          full.holdEnded()
           if (!held) s.openPage()
         }
-        onCanceled: pageHold.stop()
+        onCanceled: {
+          pageHold.stop()
+          full.holdEnded()
+        }
 
         Timer {
           id: pageHold
           interval: 450
           onTriggered: {
             pageArea.held = true
+            full.holdEnded()
             s.openPage()
           }
         }
