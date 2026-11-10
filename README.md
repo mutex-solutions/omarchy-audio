@@ -91,7 +91,14 @@ that a Bluetooth output is needed.
 | `Panel.qml` | the standalone bar widget and its popup |
 
 Output, input and per-app streams bind directly to Quickshell's Pipewire
-service, so a volume change from anywhere updates both modes immediately.
+service, so a volume change from anywhere updates both modes immediately. Device
+lists follow Omarchy's availability and platform filtering, including virtual or
+untyped sources. Choosing an output or input uses Omarchy's default-device helper,
+which also migrates existing application streams.
+
+List delegates contain primitive id/name snapshots rather than live PipeWire
+objects. The node is resolved again at action time, so graph teardown cannot leave
+a delegate or a delayed click holding a deleted object.
 
 The **Rate & codec** section reads the bundled `scripts/audio-capability`
 helper's JSON report. That helper is the join between what the hardware

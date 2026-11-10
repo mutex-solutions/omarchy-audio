@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Custom tile navigation now stays inside the originating Deck panel rather than
+  using global IPC, so opening the page cannot jump to another monitor.
+
+- Output and input selection now use Omarchy's default-device helpers, so choosing
+  a device migrates existing streams instead of only changing future playback.
+- Device lists follow Omarchy's availability/platform filtering, including
+  virtual and untyped sources; unavailable HDMI outputs no longer appear.
+- Output, input and app-stream delegates hold primitive id/name snapshots and
+  resolve nodes at action time, avoiding dangling PipeWire objects during graph
+  teardown or id reuse.
+- Fixed Sources being nested under the hidden Equalizer view. Sources is a real
+  sibling page, and its Add Source action is disabled for empty or busy input.
+- Text forms cooperate with Deck's keyboard cursor, controls expose accessible
+  actions, animations honor Omarchy's reduced-motion setting, and the UI ships an
+  English translation catalog with live language bindings.
+
 ## 0.7.1
 
 - Holding the large tile shows Deck's progress hairline, like every other tile (needs Deck 0.10.3).

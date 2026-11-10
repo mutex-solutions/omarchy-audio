@@ -1,5 +1,4 @@
 import QtQuick
-import Quickshell
 import qs.Commons
 
 // Deck adapter. The five members Deck reads, forwarded to the shared State.
@@ -23,10 +22,6 @@ Item {
     if (state) state.toggle()
   }
 
-  function openPage() {
-    Quickshell.execDetached(["omarchy-shell", "mutex-solutions.deck", "openSection", "audio"])
-  }
-
   readonly property Component tileFull: fullTile
 
   Component {
@@ -36,6 +31,7 @@ Item {
       id: full
       signal holdStarted()
       signal holdEnded()
+      signal pageRequested(string sectionId)
       readonly property var st: s.state
 
       // The background is the page door; the mute button and the slider are
@@ -52,7 +48,7 @@ Item {
         onReleased: {
           pageHold.stop()
           full.holdEnded()
-          if (!held) s.openPage()
+          if (!held) full.pageRequested("")
         }
         onCanceled: {
           pageHold.stop()
@@ -65,7 +61,7 @@ Item {
           onTriggered: {
             pageArea.held = true
             full.holdEnded()
-            s.openPage()
+            full.pageRequested("")
           }
         }
       }

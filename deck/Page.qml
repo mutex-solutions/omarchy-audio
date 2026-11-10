@@ -10,14 +10,19 @@ import qs.Commons
 Item {
   id: page
 
+  Translations { id: strings; directory: Qt.resolvedUrl("../i18n") }
+
   property var state: null
   property var host: null
 
-  implicitHeight: col.implicitHeight
+  implicitHeight: view === "main" ? mainView.implicitHeight
+    : view === "eq" ? eqView.implicitHeight : sourcesView.implicitHeight
   readonly property real level: state ? Math.max(0, Math.min(1, state.volume / 100)) : 0
   // Which view of the page is showing. The equalizer is large enough to be a
   // page of its own: reached from a row on the main view, with a way back.
   property string view: "main"
+  readonly property bool keyboardEditing: newProfileField.focused || eqSearchField.focused
+    || addTargetField.focused || addNameField.focused
 
   // The host draws the back button and the crumbs from these.
   readonly property var trail: view === "eq" ? ["Equalizer"]
@@ -30,13 +35,7 @@ Item {
   property bool appsOpen: true
   property bool advOpen: false
 
-  readonly property var sinkRows: {
-    var out = []
-    var list = page.state ? page.state.sinks : []
-    for (var i = 0; i < list.length; i++)
-      out.push({ text: page.state.nodeLabel(list[i]), current: page.state.isDefault(list[i]) })
-    return out
-  }
+  readonly property var sinkRows: page.state ? page.state.sinkChoices : []
   readonly property var profileRows: {
     var out = []
     var list = page.state ? page.state.eqProfiles : []
@@ -44,13 +43,7 @@ Item {
       out.push({ text: String(list[i].name), current: page.state.eqProfile === String(list[i].name) })
     return out
   }
-  readonly property var sourceRows: {
-    var out = []
-    var list = page.state ? page.state.sources : []
-    for (var i = 0; i < list.length; i++)
-      out.push({ text: page.state.nodeLabel(list[i]), current: page.state.isDefaultSource(list[i]) })
-    return out
-  }
+  readonly property var sourceRows: page.state ? page.state.sourceChoices : []
 
   property bool ratePickOpen: false
   property bool codecPickOpen: false
@@ -91,7 +84,7 @@ Item {
   }
 
   readonly property var rateRows: {
-    var out = [{ text: "Auto, follows what is playing", rate: 0, registered: true,
+    var out = [{ text: strings.t("audio.autoFollowsWhatIsPlaying"), rate: 0, registered: true,
                  current: !!page.state && page.state.forcedRate === 0 }]
     if (!page.state) return out
     var list = page.state.rateChoices
@@ -111,7 +104,7 @@ Item {
     return out
   }
   readonly property var prefRows: {
-    var out = [{ text: "No preference", value: "", current: !!page.state && (page.state.bt.preferred || []).length === 0 }]
+    var out = [{ text: strings.t("audio.noPreference"), value: "", current: !!page.state && (page.state.bt.preferred || []).length === 0 }]
     var list = page.state ? (page.state.bt.known || []) : []
     for (var i = 0; i < list.length; i++)
       out.push({ text: String(list[i]).toUpperCase(), value: list[i],
@@ -127,7 +120,7 @@ Item {
     var b = page.state ? page.state.bt.aacBitrateMode : null
     var out = []
     for (var i = 0; i <= 5; i++)
-      out.push({ text: "Mode " + i + (i === 0 ? " (lowest)" : i === 5 ? " (highest)" : ""), value: i, current: b === i })
+      out.push({ text: strings.t("audio.mode") + i + (i === 0 ? " (lowest)" : i === 5 ? " (highest)" : ""), value: i, current: b === i })
     return out
   }
 
@@ -422,7 +415,7 @@ Item {
         y: (parent.height - height) / 2
         x: sw.checked ? parent.width - width - Style.space(2) : Style.space(2)
         color: "#ffffff"
-        Behavior on x { NumberAnimation { duration: 90 } }
+        Behavior on x { NumberAnimation { duration: Style.duration(90) } }
       }
     }
 
@@ -852,6 +845,7 @@ Item {
   component Field: Item {
     id: field
     property alias text: input.text
+    readonly property bool focused: input.activeFocus
     property string placeholder: ""
     signal accepted()
 
@@ -894,6 +888,7 @@ Item {
       font.pixelSize: Style.font.caption
       clip: true
       selectByMouse: true
+      Keys.onEscapePressed: input.focus = false
       onAccepted: field.accepted()
     }
   }
@@ -902,19 +897,24 @@ Item {
     id: chip
     property string label: ""
     property bool selected: false
+    property bool disabled: false
     signal picked()
 
     width: chipText.implicitWidth + Style.space(16)
     height: Style.space(22)
     radius: Style.cornerRadius
+    opacity: disabled ? 0.45 : 1
     property bool hovered: false
     color: chip.selected
       ? Util.alpha(Color.accent, Style.selectedFillAlpha)
-      : chip.hovered ? Util.alpha(Color.accent, Style.hoverFillAlpha) : "transparent"
+      : chip.hovered && !chip.disabled ? Util.alpha(Color.accent, Style.hoverFillAlpha) : "transparent"
     border.width: 1
     border.color: chip.selected
       ? Util.alpha(Color.accent, 0.55)
       : Util.alpha(Color.foreground, Style.normalBorderAlpha)
+    Accessible.name: label
+    Accessible.role: Accessible.Button
+    Accessible.onPressAction: if (!disabled) picked()
 
     Text {
       id: chipText
@@ -927,8 +927,9 @@ Item {
 
     MouseArea {
       anchors.fill: parent
+      enabled: !chip.disabled
       hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
+      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
       onEntered: chip.hovered = true
       onExited: chip.hovered = false
       onClicked: chip.picked()
@@ -963,7 +964,11 @@ Item {
         open: page.outPickOpen
         rows: page.sinkRows
         onToggled: page.outPickOpen = !page.outPickOpen
-        onChosen: function(i) { page.outPickOpen = false; if (page.state) page.state.setDefault(page.state.sinks[i]) }
+        onChosen: function(i) {
+          page.outPickOpen = false
+          var row = page.sinkRows[i]
+          if (page.state && row) page.state.setDefaultChoice(row.id, row.name)
+        }
       }
 
       Item {
@@ -1064,7 +1069,11 @@ Item {
         open: page.inPickOpen
         rows: page.sourceRows
         onToggled: page.inPickOpen = !page.inPickOpen
-        onChosen: function(i) { page.inPickOpen = false; if (page.state) page.state.setDefaultSource(page.state.sources[i]) }
+        onChosen: function(i) {
+          page.inPickOpen = false
+          var row = page.sourceRows[i]
+          if (page.state && row) page.state.setDefaultSourceChoice(row.id, row.name)
+        }
       }
 
       Item {
@@ -1136,7 +1145,7 @@ Item {
             color: Color.accent
 
             Behavior on width {
-              NumberAnimation { duration: 70 }
+              NumberAnimation { duration: Style.duration(70) }
             }
           }
         }
@@ -1166,14 +1175,14 @@ Item {
           height: Style.space(22)
           verticalAlignment: Text.AlignVCenter
           leftPadding: Style.space(8)
-          text: "Nothing playing"
+          text: strings.t("audio.nothingPlaying")
           color: Util.alpha(Color.foreground, 0.4)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
 
         Repeater {
-          model: page.state ? page.state.streams : []
+          model: page.state ? page.state.streamRows : []
 
           delegate: Column {
             required property var modelData
@@ -1189,7 +1198,7 @@ Item {
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
                 width: Style.space(14)
-                text: page.state && page.state.isStreamMuted(modelData) ? "󰝟" : "󰕾"
+                text: modelData.muted ? "󰝟" : "󰕾"
                 color: Util.alpha(Color.foreground, 0.55)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
@@ -1197,7 +1206,7 @@ Item {
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: if (page.state) page.state.toggleStreamMute(modelData)
+                  onClicked: if (page.state) page.state.toggleStreamMuteById(modelData.id, modelData.name)
                 }
               }
 
@@ -1207,7 +1216,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 width: Style.space(34)
                 horizontalAlignment: Text.AlignRight
-                text: page.state ? page.state.streamVolume(modelData) + "%" : ""
+                text: modelData.volume + "%"
                 color: Util.alpha(Color.foreground, 0.6)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
@@ -1219,7 +1228,8 @@ Item {
                 anchors.right: streamValue.left
                 anchors.rightMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
-                text: page.state ? page.state.streamLabel(modelData) : ""
+                textFormat: Text.PlainText
+                text: modelData.label
                 color: Color.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
@@ -1229,8 +1239,8 @@ Item {
 
             Level {
               width: parent.width
-              value: page.state ? page.state.streamVolume(modelData) / 100 : 0
-              onMoved: function(pct) { if (page.state) page.state.setStreamVolume(modelData, pct) }
+              value: modelData.volume / 100
+              onMoved: function(pct) { if (page.state) page.state.setStreamVolumeById(modelData.id, modelData.name, pct) }
             }
           }
         }
@@ -1266,7 +1276,7 @@ Item {
           height: Style.space(24)
           verticalAlignment: Text.AlignVCenter
           leftPadding: Style.space(8)
-          text: "Sample rate and codec controls are unavailable"
+          text: strings.t("audio.sampleRateAndCodecControlsAreUnavailable")
           color: Util.alpha(Color.foreground, 0.4)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -1275,7 +1285,7 @@ Item {
         Caps {
           visible: page.state && page.state.reportLoaded
           leftPadding: Style.space(8)
-          text: "SAMPLE RATE"
+          text: strings.t("audio.sampleRate")
         }
 
         // `clock.force-rate` is the lever that acts now: 0 is Auto. A rate the
@@ -1303,7 +1313,7 @@ Item {
           visible: page.state && page.state.reportLoaded
           topPadding: Style.space(6)
           leftPadding: Style.space(8)
-          text: "REGISTERED RATES"
+          text: strings.t("audio.registeredRates")
         }
 
         Text {
@@ -1347,19 +1357,19 @@ Item {
           spacing: Style.space(6)
 
           Chip {
-            label: "Discover"
+            label: strings.t("audio.discover")
             onPicked: if (page.state) { page.state.refreshReport(); page.state.refreshStatus() }
           }
 
           Chip {
             visible: page.state && (page.state.unregisteredRates.length > 0 || !page.state.filesOurs)
-            label: "Register"
+            label: strings.t("audio.register")
             onPicked: if (page.state) page.state.registerRates()
           }
 
           Chip {
             visible: page.state && page.state.needsLive
-            label: "Make live"
+            label: strings.t("audio.makeLive")
             onPicked: if (page.state) page.state.makeLive()
           }
 
@@ -1396,7 +1406,7 @@ Item {
           visible: page.state && page.state.isBluetooth
           topPadding: Style.space(6)
           leftPadding: Style.space(8)
-          text: "CODEC, SWITCH NOW"
+          text: strings.t("audio.codecSwitchNow")
         }
 
         Pick {
@@ -1416,7 +1426,7 @@ Item {
           visible: page.state && page.state.isBluetooth
           topPadding: Style.space(6)
           leftPadding: Style.space(8)
-          text: "PREFER AT CONNECT"
+          text: strings.t("audio.preferAtConnect")
         }
 
         Pick {
@@ -1439,7 +1449,7 @@ Item {
           visible: page.state && page.state.isBluetooth
           topPadding: Style.space(6)
           leftPadding: Style.space(8)
-          text: "LDAC QUALITY"
+          text: strings.t("audio.ldacQuality")
         }
 
         Pick {
@@ -1459,7 +1469,7 @@ Item {
           visible: page.state && page.state.isBluetooth
           topPadding: Style.space(6)
           leftPadding: Style.space(8)
-          text: "AAC BITRATE MODE"
+          text: strings.t("audio.aacBitrateMode")
         }
 
         Pick {
@@ -1482,7 +1492,7 @@ Item {
           topPadding: Style.space(3)
           bottomPadding: Style.space(3)
           leftPadding: Style.space(8)
-          text: "Codec options appear with a Bluetooth output"
+          text: strings.t("audio.codecOptionsAppearWithABluetoothOutput")
           color: Util.alpha(Color.foreground, 0.4)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -1558,7 +1568,7 @@ Item {
           anchors.right: eqMaster.left
           anchors.rightMargin: Style.space(10)
           anchors.verticalCenter: parent.verticalCenter
-          label: "Apply"
+          label: strings.t("audio.apply")
           onPicked: page.applyEqChanges()
         }
       }
@@ -1572,7 +1582,7 @@ Item {
         height: Style.space(24)
         verticalAlignment: Text.AlignVCenter
         leftPadding: Style.space(8)
-        text: "Install audio-eq to enable headphone EQ"
+        text: strings.t("audio.installAudioEqToEnableHeadphoneEq")
         color: Util.alpha(Color.foreground, 0.4)
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
@@ -1599,7 +1609,7 @@ Item {
         spacing: Style.space(6)
 
         Chip {
-          label: "New"
+          label: strings.t("audio.new")
           selected: page.newProfileOpen
           onPicked: {
             page.newProfileOpen = !page.newProfileOpen
@@ -1626,7 +1636,7 @@ Item {
       Field {
         id: newProfileField
         visible: page.newProfileOpen
-        placeholder: "Name for the new profile"
+        placeholder: strings.t("audio.nameForTheNewProfile")
         onAccepted: page.createProfile(text)
       }
 
@@ -1639,7 +1649,7 @@ Item {
           anchors.left: parent.left
           anchors.leftMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
-          label: "Save current as new"
+          label: strings.t("audio.saveCurrentAsNew")
           onPicked: page.createProfile(newProfileField.text)
         }
       }
@@ -1675,7 +1685,8 @@ Item {
         visible: page.eqSearchOpen
 
         Field {
-          placeholder: "Type a headphone model"
+          id: eqSearchField
+          placeholder: strings.t("audio.typeAHeadphoneModel")
           onTextChanged: page.eqSearchText = text
           onAccepted: {
             searchDebounce.stop()
@@ -1832,7 +1843,7 @@ Item {
                 anchors.left: parent.left
                 anchors.leftMargin: Style.space(16)
                 anchors.verticalCenter: parent.verticalCenter
-                text: "Show " + (group.modelData.items.length - 3) + " more"
+                text: strings.t("audio.show") + (group.modelData.items.length - 3) + " more"
                 color: moreMouse.containsMouse ? Color.accent : Util.alpha(Color.foreground, 0.5)
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
@@ -1876,7 +1887,7 @@ Item {
 
         BandSlider {
           width: parent.width
-          label: "Preamp"
+          label: strings.t("audio.preamp")
           valueText: page.fmtGain(page.eqPreampLocal)
           value: page.eqPreampLocal
           minValue: -15
@@ -2093,7 +2104,7 @@ Item {
 
               BandSlider {
                 width: parent.width
-                label: "Frequency"
+                label: strings.t("audio.frequency")
                 valueText: page.fmtFreq(freq)
                 value: freq
                 minValue: 20
@@ -2105,7 +2116,7 @@ Item {
 
               BandSlider {
                 width: parent.width
-                label: "Gain"
+                label: strings.t("audio.gain")
                 valueText: page.fmtGain(gainDb)
                 value: gainDb
                 minValue: -15
@@ -2117,7 +2128,7 @@ Item {
 
               BandSlider {
                 width: parent.width
-                label: "Q"
+                label: strings.t("audio.q")
                 valueText: page.fmtQ(qValue)
                 value: qValue
                 minValue: 0.1
@@ -2145,7 +2156,7 @@ Item {
             anchors.left: parent.left
             anchors.leftMargin: Style.space(8)
             anchors.verticalCenter: parent.verticalCenter
-            label: "+ Add band"
+            label: strings.t("audio.addBand")
             onPicked: page.addBand()
           }
 
@@ -2161,7 +2172,9 @@ Item {
         }
       }
 
-    // ---- sources view ----
+    }
+
+    // ---- sources view (a sibling of eqView, not a child hidden by it) ----
     Column {
       id: sourcesView
       width: parent.width
@@ -2200,7 +2213,7 @@ Item {
               visible: srcRow.modelData.builtin === true
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              text: "built in"
+              text: strings.t("audio.builtIn")
               color: Util.alpha(Color.foreground, 0.4)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -2273,7 +2286,7 @@ Item {
           anchors.left: parent.left
           anchors.leftMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
-          label: "Refresh all"
+          label: strings.t("audio.refreshAll")
           onPicked: if (page.state) page.state.eqSourceRefresh("")
         }
 
@@ -2282,7 +2295,7 @@ Item {
           anchors.rightMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
           visible: page.state && page.state.eqSourcesBusy
-          text: "Working…"
+          text: strings.t("audio.working")
           color: Util.alpha(Color.foreground, 0.5)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -2364,19 +2377,19 @@ Item {
           spacing: Style.space(6)
 
           Chip {
-            label: "GitHub repo"
+            label: strings.t("audio.githubRepo")
             selected: page.addKind === "github"
             onPicked: page.addKind = "github"
           }
 
           Chip {
-            label: "List address"
+            label: strings.t("audio.listAddress")
             selected: page.addKind === "json"
             onPicked: page.addKind = "json"
           }
 
           Chip {
-            label: "Folder"
+            label: strings.t("audio.folder")
             selected: page.addKind === "folder"
             onPicked: page.addKind = "folder"
           }
@@ -2393,7 +2406,7 @@ Item {
 
       Field {
         id: addNameField
-        placeholder: "Name (optional)"
+        placeholder: strings.t("audio.nameOptional")
         onAccepted: addButton.picked()
       }
 
@@ -2407,6 +2420,7 @@ Item {
           anchors.leftMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
           label: page.state && page.state.eqSourcesBusy && page.addPending ? "Checking…" : "Add source"
+          disabled: !page.state || page.state.eqSourcesBusy || String(addTargetField.text).trim() === ""
           onPicked: {
             if (!page.state || page.state.eqSourcesBusy) return
             if (String(addTargetField.text).trim() === "") return
@@ -2427,7 +2441,6 @@ Item {
         font.family: Style.font.family
         font.pixelSize: Style.font.caption
       }
-    }
     }
   }
 }

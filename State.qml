@@ -2,6 +2,8 @@ import QtQuick
 import Quickshell
 import Quickshell.Services.Pipewire
 import Quickshell.Io
+import qs.Commons
+import "/usr/share/omarchy/shell/plugins/panels/audio/Model.js" as AudioModel
 
 // Audio state. One instance, shared by the standalone bar widget and by Deck.
 //
@@ -13,32 +15,128 @@ import Quickshell.Io
 Item {
   id: s
 
+  Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
+
   // ---------------------------------------------------------------- output
-  readonly property var sink: Pipewire.defaultAudioSink
+  readonly property var defaultSink: Pipewire.defaultAudioSink
+  property string effectiveSinkName: ""
+  readonly property var nodes: Pipewire.nodes ? Pipewire.nodes.values : []
+  readonly property var sink: {
+    if (!defaultSink) return null
+    if (effectiveSinkName === "") return defaultSink
+    for (var i = 0; i < nodes.length; i++)
+      if (nodes[i] && nodes[i].name === effectiveSinkName) return nodes[i]
+    return defaultSink
+  }
   readonly property var audio: sink ? sink.audio : null
 
   readonly property bool active: !!audio && !audio.muted
   readonly property int volume: audio ? Math.round(audio.volume * 100) : 0
   readonly property bool muted: audio ? !!audio.muted : false
 
-  readonly property string label: "Audio"
+  readonly property string label: strings.t("audio.audio")
   readonly property string detail: muted ? "muted" : (volume + "%")
   readonly property string icon: "󰕾"
 
   readonly property string deviceName: {
-    if (!sink) return "No output device"
-    return String(sink.nickname || sink.description || sink.name || "Output")
+    if (!defaultSink) return "No output device"
+    return String(defaultSink.nickname || defaultSink.description || defaultSink.name || "Output")
   }
 
+  function resolveEffectiveSink() {
+    if (!defaultSink) { effectiveSinkName = ""; return }
+    // Deck's EQ deliberately exposes its own preamp/volume model.
+    if (String(defaultSink.name || "") === "deck_eq") {
+      effectiveSinkName = "deck_eq"
+      return
+    }
+    effectiveSinkResolver.command = ["omarchy-audio-output-sink", String(defaultSink.name || "")]
+    if (!effectiveSinkResolver.running) effectiveSinkResolver.running = true
+  }
+  onDefaultSinkChanged: resolveEffectiveSink()
+
+  Process {
+    id: effectiveSinkResolver
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: s.effectiveSinkName = text.trim()
+    }
+  }
+
+  readonly property var nodeNames: {
+    var names = []
+    for (var i = 0; i < nodes.length; i++) if (nodes[i] && nodes[i].name) names.push(String(nodes[i].name))
+    return names
+  }
+  function platformHides(node) { return !!node && AudioNodes.platformHides(node.name, nodeNames) }
+
+  property var sinkAvailability: ({})
+  property var sourceAvailability: ({})
+  property bool availabilityLoaded: false
+  function parseAvailability(raw, target) {
+    var next = ({})
+    var lines = String(raw || "").split(/\r?\n/)
+    for (var i = 0; i < lines.length; i++) {
+      var parts = lines[i].split("\t")
+      if (parts.length === 2 && parts[0] !== "") next[parts[0]] = parts[1] === "1"
+    }
+    if (target === "sinks") s.sinkAvailability = next
+    else s.sourceAvailability = next
+    s.availabilityLoaded = true
+  }
+  function refreshAvailability() {
+    if (!sinkAvailabilityProc.running) sinkAvailabilityProc.running = true
+    if (!sourceAvailabilityProc.running) sourceAvailabilityProc.running = true
+  }
+  Process {
+    id: sinkAvailabilityProc
+    command: ["omarchy-audio-sink-availability"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: s.parseAvailability(text, "sinks") }
+  }
+  Process {
+    id: sourceAvailabilityProc
+    command: ["omarchy-audio-sink-availability", "sources"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: s.parseAvailability(text, "sources") }
+  }
+  Timer {
+    interval: 5000
+    repeat: true
+    running: s.meterActive
+    onTriggered: s.refreshAvailability()
+  }
+  onNodesChanged: if (availabilityLoaded) refreshAvailability()
+
   readonly property var sinks: {
-    var src = Pipewire.nodes ? Pipewire.nodes.values : []
     var out = []
-    for (var i = 0; i < src.length; i++) {
-      var n = src[i]
-      if (n && n.isSink && !n.isStream) out.push(n)
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i]
+      if (!n || !n.isSink || n.isStream || platformHides(n)) continue
+      if (availabilityLoaded && sinkAvailability[String(n.name || "")] === false && n !== defaultSink) continue
+      out.push(n)
     }
     return out
   }
+
+  // Delegates hold primitives only. PipeWire can delete a node while a delegate
+  // is being built; the live object is resolved again at the action itself, and
+  // the constant name prevents an id recycled for another node being selected.
+  function nodeById(id, name, list) {
+    for (var i = 0; i < (list || []).length; i++) {
+      var n = list[i]
+      if (n && n.id === id && String(n.name || "") === String(name || "")) return n
+    }
+    return null
+  }
+
+  readonly property var sinkChoices: {
+    var out = []
+    for (var i = 0; i < sinks.length; i++) {
+      var n = sinks[i]
+      out.push({ id: n.id, name: String(n.name || ""), text: nodeLabel(n), current: isDefault(n) })
+    }
+    return out
+  }
+  function setDefaultChoice(id, name) { setDefault(nodeById(id, name, sinks)) }
 
   function toggle() {
     if (audio) audio.muted = !audio.muted
@@ -50,7 +148,9 @@ Item {
   }
 
   function setDefault(node) {
-    if (node) Pipewire.preferredDefaultAudioSink = node
+    if (!node) return
+    Pipewire.preferredDefaultAudioSink = node
+    Quickshell.execDetached(["omarchy-audio-output-set-default", String(node.id), String(node.name)])
   }
 
   function nodeLabel(node) {
@@ -59,14 +159,15 @@ Item {
   }
 
   function isDefault(node) {
-    return !!sink && !!node && node.id === sink.id
+    return !!defaultSink && !!node && node.id === defaultSink.id
   }
 
   // ----------------------------------------------------------------- input
   readonly property var source: Pipewire.defaultAudioSource
   readonly property var sourceAudio: source ? source.audio : null
-  readonly property int inputVolume: sourceAudio ? Math.round(sourceAudio.volume * 100) : 0
-  readonly property bool inputMuted: sourceAudio ? !!sourceAudio.muted : false
+  readonly property int inputVolume: sourceAudio ? Math.round(sourceAudio.volume * 100)
+    : (UntypedInput.known ? Math.round(UntypedInput.volume * 100) : 0)
+  readonly property bool inputMuted: sourceAudio ? !!sourceAudio.muted : UntypedInput.muted
   readonly property string sourceName: {
     if (!source) return "No input device"
     return String(source.nickname || source.description || source.name || "Input")
@@ -89,29 +190,42 @@ Item {
   }
 
   readonly property var sources: {
-    var src = Pipewire.nodes ? Pipewire.nodes.values : []
     var out = []
-    for (var i = 0; i < src.length; i++) {
-      var n = src[i]
-      if (!n || n.isSink || n.isStream) continue
-      var t = String(n.type || "")
-      if (n.audio || t.indexOf("Audio/Source") !== -1 || t.indexOf("AudioSource") !== -1)
-        out.push(n)
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i]
+      if (!n || n.isSink || n.isStream || platformHides(n) || String(n.name || "") === "quickshell") continue
+      if (!AudioModel.isAudioSource(n) && !AudioModel.isUntypedSource(n, sourceAvailability)) continue
+      if (availabilityLoaded && sourceAvailability[String(n.name || "")] === false && n !== source) continue
+      out.push(n)
     }
     return out
   }
 
+  readonly property var sourceChoices: {
+    var out = []
+    for (var i = 0; i < sources.length; i++) {
+      var n = sources[i]
+      out.push({ id: n.id, name: String(n.name || ""), text: nodeLabel(n), current: isDefaultSource(n) })
+    }
+    return out
+  }
+  function setDefaultSourceChoice(id, name) { setDefaultSource(nodeById(id, name, sources)) }
+
   function setInputVolume(pct) {
-    if (!sourceAudio) return
-    sourceAudio.volume = Math.max(0, Math.min(1.5, Number(pct) / 100))
+    var value = Math.max(0, Math.min(1.5, Number(pct) / 100))
+    if (sourceAudio) sourceAudio.volume = value
+    else UntypedInput.setVolume(Math.min(1, value))
   }
 
   function toggleInputMute() {
     if (sourceAudio) sourceAudio.muted = !sourceAudio.muted
+    else UntypedInput.setMuted(!inputMuted)
   }
 
   function setDefaultSource(node) {
-    if (node) Pipewire.preferredDefaultAudioSource = node
+    if (!node) return
+    Pipewire.preferredDefaultAudioSource = node
+    Quickshell.execDetached(["omarchy-audio-input-set-default", String(node.id), String(node.name)])
   }
 
   function isDefaultSource(node) {
@@ -136,6 +250,20 @@ Item {
     }
     return out
   }
+
+  readonly property var streamRows: {
+    var out = []
+    for (var i = 0; i < streams.length; i++) {
+      var n = streams[i]
+      out.push({ id: n.id, name: String(n.name || ""), label: streamLabel(n),
+        volume: streamVolume(n), muted: isStreamMuted(n) })
+    }
+    return out
+  }
+  function setStreamVolumeById(id, name, pct) {
+    setStreamVolume(nodeById(id, name, streams), pct)
+  }
+  function toggleStreamMuteById(id, name) { toggleStreamMute(nodeById(id, name, streams)) }
 
   function streamLabel(node) {
     var p = props(node)
@@ -614,6 +742,8 @@ Item {
   }
 
   Component.onCompleted: {
+    resolveEffectiveSink()
+    refreshAvailability()
     refreshReport()
     refreshStatus()
     refreshEq()
